@@ -1,0 +1,7 @@
+{
+  "STUDENT": "student",
+  "STAFF": "staff",
+  "ADMIN": "admin",
+  "AUDITOR": "auditor",
+  "VISITOR": "visitor"
+}

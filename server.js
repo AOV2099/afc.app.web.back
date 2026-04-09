@@ -4,7 +4,6 @@ import cookieParser from "cookie-parser";
 
 import { connectRedis, getRedisClient } from "./src/redisClient.js";
 import { connectPostgres, closePostgres } from "./src/postgresClient.js";
-import { ALLOWED_ORIGINS } from "./src/config/appConfig.js";
 
 import healthRoutes from "./src/routes/healthRoutes.js";
 import authRoutes from "./src/routes/authRoutes.js";
@@ -16,11 +15,14 @@ const app = express();
 const PORT = Number(process.env.PORT || 3000);
  
 const corsOptions = {
-  origin(origin, callback) {
-    if (!origin) return callback(null, true);
-    if (ALLOWED_ORIGINS.includes(origin)) return callback(null, true);
-    return callback(new Error("Origen no permitido por CORS"));
-  },
+  // Temporal: permitir cualquier origen.
+  origin: true,
+  // Lógica anterior de lista blanca (temporalmente deshabilitada):
+  // origin(origin, callback) {
+  //   if (!origin) return callback(null, true);
+  //   if (ALLOWED_ORIGINS.includes(origin)) return callback(null, true);
+  //   return callback(new Error("Origen no permitido por CORS"));
+  // },
   credentials: true,
   optionsSuccessStatus: 200,
 };

@@ -177,6 +177,16 @@ ALTER TABLE users
 ALTER TABLE users
   ADD COLUMN IF NOT EXISTS attributes JSONB;
 
+ALTER TABLE users
+  ADD COLUMN IF NOT EXISTS oauth_provider TEXT;
+
+ALTER TABLE users
+  ADD COLUMN IF NOT EXISTS oauth_subject TEXT;
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_users_oauth_identity
+  ON users (oauth_provider, oauth_subject)
+  WHERE oauth_provider IS NOT NULL AND oauth_subject IS NOT NULL;
+
 DO $$ BEGIN
   ALTER TABLE users
     ADD CONSTRAINT fk_users_career_id
@@ -273,6 +283,7 @@ CREATE TABLE IF NOT EXISTS events (
   -- Basic sanity checks
   CONSTRAINT chk_events_time_range CHECK (ends_at > starts_at),
   CONSTRAINT chk_events_hours_nonnegative CHECK (hours_value >= 0),
+  CONSTRAINT chk_events_hours_max CHECK (hours_value <= 100),
   CONSTRAINT chk_events_capacity_nonnegative CHECK (capacity IS NULL OR capacity >= 0),
   CONSTRAINT chk_events_capacity_when_enabled CHECK (
     (capacity_enabled = false AND capacity IS NULL)
@@ -429,7 +440,8 @@ CREATE TABLE IF NOT EXISTS event_sessions (
   label         TEXT,
   hours_value   NUMERIC(6,2), -- if NULL, fallback to events.hours_value
   created_at    TIMESTAMPTZ NOT NULL DEFAULT now(),
-  CONSTRAINT chk_event_sessions_time_range CHECK (ends_at > starts_at)
+  CONSTRAINT chk_event_sessions_time_range CHECK (ends_at > starts_at),
+  CONSTRAINT chk_event_sessions_hours_range CHECK (hours_value IS NULL OR hours_value BETWEEN 0 AND 100)
 );
 
 CREATE INDEX IF NOT EXISTS idx_event_sessions_event_starts

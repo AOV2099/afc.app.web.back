@@ -5,11 +5,24 @@ import {
   RESUBMISSION_POLICIES,
 } from "../config/appConfig.js";
 
+export const MAX_EVENT_HOURS = 100;
+
 export function parseIsoDateOrNull(value) {
   if (value === undefined || value === null || value === "") return null;
   const date = new Date(value);
   if (Number.isNaN(date.getTime())) return null;
   return date;
+}
+
+export function parsePlainDecimalOrNull(value) {
+  if (typeof value === "number") return Number.isFinite(value) ? value : null;
+  if (typeof value !== "string") return null;
+
+  const normalized = value.trim();
+  if (!/^\d+(?:\.\d{1,2})?$/.test(normalized)) return null;
+
+  const parsed = Number(normalized);
+  return Number.isFinite(parsed) ? parsed : null;
 }
 
 function parseBooleanInput(value, defaultValue = false) {
@@ -44,7 +57,8 @@ export function normalizeCreateEventPayload(body) {
   const startsAt = parseIsoDateOrNull(body?.starts_at);
   const endsAt = parseIsoDateOrNull(body?.ends_at);
 
-  const hoursValue = body?.hours_value === undefined ? 0 : Number(body.hours_value);
+  const hoursValue =
+    body?.hours_value === undefined ? 0 : parsePlainDecimalOrNull(body.hours_value);
   const capacityEnabledRaw = body?.capacity_enabled ?? body?.capacityEnabled ?? false;
   const capacityEnabled = parseBooleanInput(capacityEnabledRaw, false);
   const capacityRaw = body?.capacity;
@@ -60,8 +74,8 @@ export function normalizeCreateEventPayload(body) {
     body?.resubmission_policy === undefined
       ? "only_changes_requested"
       : String(body.resubmission_policy).trim();
-  const allowSelfCheckin = Boolean(body?.allow_self_checkin ?? false);
-  const geoEnforced = Boolean(body?.geo_enforced ?? false);
+  const allowSelfCheckin = parseBooleanInput(body?.allow_self_checkin, false);
+  const geoEnforced = parseBooleanInput(body?.geo_enforced, false);
   const cancelPolicy =
     body?.cancel_policy === undefined ? "free_cancel" : String(body.cancel_policy).trim();
   const cancelDeadline =
@@ -70,32 +84,37 @@ export function normalizeCreateEventPayload(body) {
       : parseIsoDateOrNull(body.cancel_deadline);
   const attributes = body?.attributes === undefined ? {} : body.attributes;
 
-  if (!title) return { error: "title es requerido." };
-  if (!startsAt) return { error: "starts_at es requerido y debe ser una fecha ISO válida." };
-  if (!endsAt) return { error: "ends_at es requerido y debe ser una fecha ISO válida." };
-  if (endsAt <= startsAt) return { error: "ends_at debe ser mayor que starts_at." };
-  if (Number.isNaN(hoursValue) || hoursValue < 0) {
-    return { error: "hours_value debe ser un número mayor o igual a 0." };
+  if (!title) return { error: "El título del evento es obligatorio." };
+  if (!startsAt) return { error: "La fecha y hora de inicio son obligatorias y deben ser válidas." };
+  if (!endsAt) return { error: "La fecha y hora de fin son obligatorias y deben ser válidas." };
+  const now = new Date();
+  if (startsAt < now) return { error: "La fecha y hora de inicio no pueden estar en el pasado." };
+  if (endsAt < now) return { error: "La fecha y hora de fin no pueden estar en el pasado." };
+  if (endsAt <= startsAt) return { error: "La fecha y hora de fin deben ser posteriores al inicio." };
+  if (hoursValue === null || hoursValue < 0 || hoursValue > MAX_EVENT_HOURS) {
+    return {
+      error: `Las horas acreditables deben ser un decimal entre 0 y ${MAX_EVENT_HOURS}, sin letras ni notación científica.`,
+    };
   }
   if (capacityEnabled) {
     if (!Number.isInteger(capacity) || capacity <= 0) {
-      return { error: "capacity debe ser un entero mayor a 0 cuando capacity_enabled=true." };
+      return { error: "El cupo debe ser un entero mayor a 0 cuando está habilitado." };
     }
   } else if (capacity !== null && (Number.isNaN(capacity) || !Number.isInteger(capacity))) {
-    return { error: "capacity debe ser un entero válido." };
+    return { error: "El cupo debe ser un número entero válido." };
   }
-  if (!category) return { error: "category es requerido." };
-  if (!EVENT_STATUSES.has(status)) return { error: "status inválido." };
-  if (!REGISTRATION_MODES.has(registrationMode)) return { error: "registration_mode inválido." };
+  if (!category) return { error: "La categoría es obligatoria." };
+  if (!EVENT_STATUSES.has(status)) return { error: "El estatus seleccionado no es válido." };
+  if (!REGISTRATION_MODES.has(registrationMode)) return { error: "El modo de registro seleccionado no es válido." };
   if (!RESUBMISSION_POLICIES.has(resubmissionPolicy)) {
-    return { error: "resubmission_policy inválido." };
+    return { error: "La política de reenvío seleccionada no es válida." };
   }
-  if (!CANCEL_POLICIES.has(cancelPolicy)) return { error: "cancel_policy inválido." };
+  if (!CANCEL_POLICIES.has(cancelPolicy)) return { error: "La política de cancelación seleccionada no es válida." };
   if (cancelDeadline && cancelDeadline > startsAt) {
-    return { error: "cancel_deadline no puede ser posterior a starts_at." };
+    return { error: "La fecha límite de cancelación no puede ser posterior al inicio del evento." };
   }
   if (attributes === null || typeof attributes !== "object" || Array.isArray(attributes)) {
-    return { error: "attributes debe ser un objeto JSON." };
+    return { error: "Los datos adicionales del evento no tienen un formato válido." };
   }
 
   const normalizedAttributes = { ...attributes };
@@ -110,7 +129,7 @@ export function normalizeCreateEventPayload(body) {
   if (geoEnforced) {
     const geoPayload = body?.geo;
     if (!geoPayload || typeof geoPayload !== "object") {
-      return { error: "geo es requerido cuando geo_enforced=true." };
+      return { error: "Captura los datos de ubicación cuando la geocerca está habilitada." };
     }
 
     const centerLat = Number(geoPayload.center_lat);
@@ -124,12 +143,18 @@ export function normalizeCreateEventPayload(body) {
     if (Number.isNaN(centerLat) || Number.isNaN(centerLng) || Number.isNaN(radiusM)) {
       return {
         error:
-          "geo.center_lat, geo.center_lng y geo.radius_m son requeridos y deben ser numéricos.",
+          "La latitud, longitud y radio de la geocerca son obligatorios y deben ser numéricos.",
       };
     }
-    if (radiusM <= 0) return { error: "geo.radius_m debe ser mayor a 0." };
+    if (centerLat < -90 || centerLat > 90) {
+      return { error: "La latitud debe estar entre -90 y 90." };
+    }
+    if (centerLng < -180 || centerLng > 180) {
+      return { error: "La longitud debe estar entre -180 y 180." };
+    }
+    if (radiusM <= 0) return { error: "El radio de la geocerca debe ser mayor a 0." };
     if (strictAccuracyM !== null && (Number.isNaN(strictAccuracyM) || strictAccuracyM <= 0)) {
-      return { error: "geo.strict_accuracy_m debe ser mayor a 0 cuando se envía." };
+      return { error: "La precisión de la geocerca debe ser mayor a 0 cuando se captura." };
     }
 
     geo = {
@@ -152,7 +177,7 @@ export function normalizeCreateEventPayload(body) {
     ];
   } else {
     if (!Array.isArray(body.sessions) || body.sessions.length === 0) {
-      return { error: "sessions debe ser un arreglo con al menos una sesión." };
+      return { error: "Agrega al menos una sesión válida al evento." };
     }
 
     for (let i = 0; i < body.sessions.length; i += 1) {
@@ -163,24 +188,29 @@ export function normalizeCreateEventPayload(body) {
         session?.label === undefined || session?.label === null
           ? null
           : String(session.label).trim();
+      const hasSessionHoursValue =
+        session?.hours_value !== undefined && session?.hours_value !== null;
       const sessionHoursValue =
-        session?.hours_value === undefined || session?.hours_value === null
+        !hasSessionHoursValue
           ? null
-          : Number(session.hours_value);
+          : parsePlainDecimalOrNull(session.hours_value);
 
       if (!sessionStartsAt || !sessionEndsAt) {
         return {
-          error: `sessions[${i}] requiere starts_at y ends_at con fechas ISO válidas.`,
+          error: `La sesión ${i + 1} requiere una fecha y hora de inicio y fin válidas.`,
         };
       }
       if (sessionEndsAt <= sessionStartsAt) {
-        return { error: `sessions[${i}] debe cumplir ends_at > starts_at.` };
+        return { error: `En la sesión ${i + 1}, la fecha y hora de fin deben ser posteriores al inicio.` };
+      }
+      if (sessionStartsAt < startsAt || sessionEndsAt > endsAt) {
+        return { error: `La sesión ${i + 1} debe estar dentro de las fechas del evento.` };
       }
       if (
-        sessionHoursValue !== null &&
-        (Number.isNaN(sessionHoursValue) || sessionHoursValue < 0)
+        hasSessionHoursValue &&
+        (sessionHoursValue === null || sessionHoursValue < 0 || sessionHoursValue > MAX_EVENT_HOURS)
       ) {
-        return { error: `sessions[${i}].hours_value debe ser >= 0 o null.` };
+        return { error: `Las horas acreditables de la sesión ${i + 1} deben estar entre 0 y ${MAX_EVENT_HOURS}.` };
       }
 
       sessions.push({

@@ -12,6 +12,17 @@ export const COOKIE_SECURE = String(process.env.COOKIE_SECURE || "false") === "t
 export const COOKIE_SAMESITE = process.env.COOKIE_SAMESITE || "lax";
 export const COOKIE_DOMAIN = process.env.COOKIE_DOMAIN || undefined;
 
+export const GOOGLE_CLIENT_ID = String(process.env.GOOGLE_CLIENT_ID || "").trim();
+export const GOOGLE_CLIENT_SECRET = String(process.env.GOOGLE_CLIENT_SECRET || "").trim();
+export const GOOGLE_OAUTH_REDIRECT_URI =
+  String(process.env.GOOGLE_OAUTH_REDIRECT_URI || "").trim().replace(/\/$/, "");
+export const GOOGLE_ALLOWED_EMAIL_DOMAIN = String(
+  process.env.GOOGLE_ALLOWED_EMAIL_DOMAIN || "",
+)
+  .trim()
+  .replace(/^@/, "")
+  .toLowerCase();
+
 export const ALLOWED_MEMBERSHIP_ROLES = new Set(Object.values(ROLES));
 
 export const EVENT_STATUSES = new Set(["draft", "published", "cancelled", "ended"]);

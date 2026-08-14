@@ -22,6 +22,29 @@ export const GOOGLE_ALLOWED_EMAIL_DOMAIN = String(
   .trim()
   .replace(/^@/, "")
   .toLowerCase();
+export const GOOGLE_OAUTH_BRIDGE_START_URL = String(
+  process.env.GOOGLE_OAUTH_BRIDGE_START_URL || "",
+).trim();
+export const GOOGLE_OAUTH_BRIDGE_VERIFY_URL = String(
+  process.env.GOOGLE_OAUTH_BRIDGE_VERIFY_URL || "",
+).trim();
+export const GOOGLE_OAUTH_BRIDGE_SHARED_SECRET = String(
+  process.env.GOOGLE_OAUTH_BRIDGE_SHARED_SECRET || "",
+).trim();
+const googleBridgeTimeoutMs = Number(process.env.GOOGLE_OAUTH_BRIDGE_TIMEOUT_MS || 5000);
+export const GOOGLE_OAUTH_BRIDGE_TIMEOUT_MS = Number.isFinite(googleBridgeTimeoutMs)
+  ? Math.max(1000, googleBridgeTimeoutMs)
+  : 5000;
+const googleBridgeAttemptTtl = Number(
+  process.env.GOOGLE_OAUTH_BRIDGE_ATTEMPT_TTL_SECONDS || 300,
+);
+export const GOOGLE_OAUTH_BRIDGE_ATTEMPT_TTL_SECONDS = Number.isFinite(
+  googleBridgeAttemptTtl,
+)
+  ? Math.min(600, Math.max(60, Math.trunc(googleBridgeAttemptTtl)))
+  : 300;
+export const GOOGLE_OAUTH_BRIDGE_ATTEMPT_COOKIE_NAME =
+  process.env.GOOGLE_OAUTH_BRIDGE_ATTEMPT_COOKIE_NAME || "afc_oauth_attempt";
 
 export const ALLOWED_MEMBERSHIP_ROLES = new Set(Object.values(ROLES));
 

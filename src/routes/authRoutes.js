@@ -10,9 +10,10 @@ import {
   COOKIE_SAMESITE,
   COOKIE_SECURE,
   DEFAULT_ORG_ID,
-  GOOGLE_ALLOWED_EMAIL_DOMAIN,
   GOOGLE_CLIENT_ID,
   GOOGLE_CLIENT_SECRET,
+  GOOGLE_OAUTH_BRIDGE_ATTEMPT_COOKIE_NAME,
+  GOOGLE_OAUTH_BRIDGE_ATTEMPT_TTL_SECONDS,
   GOOGLE_OAUTH_REDIRECT_URI,
   SESSION_COOKIE_NAME,
   SESSION_TTL_SECONDS,
@@ -20,6 +21,15 @@ import {
 } from "../config/appConfig.js";
 import { requireAuth } from "../middleware/auth.js";
 import { safeUserPayload, sessionKey } from "../utils/session.js";
+import {
+  authenticateGoogleIdentity,
+  GoogleIdentityError,
+} from "../services/googleIdentityService.js";
+import {
+  buildGoogleBridgeAuthorizationUrl,
+  GoogleOAuthBridgeError,
+  redeemGoogleBridgeCode,
+} from "../services/googleOAuthBridgeClient.js";
 
 const router = Router();
 
@@ -49,16 +59,29 @@ async function createAuthenticatedSession(redis, userRow) {
   return sessionId;
 }
 
-function getGoogleProfileNames(payload, email) {
-  const fullNameParts = String(payload?.name || "").trim().split(/\s+/).filter(Boolean);
-  const firstName =
-    String(payload?.given_name || "").trim() ||
-    fullNameParts.shift() ||
-    String(email).split("@")[0];
-  const lastName =
-    String(payload?.family_name || "").trim() || fullNameParts.join(" ") || "-";
+function bridgeAttemptKey(attempt) {
+  return `oauth_bridge_attempt:${crypto.createHash("sha256").update(attempt).digest("hex")}`;
+}
 
-  return { firstName, lastName };
+function setBridgeAttemptCookie(res, attempt) {
+  res.cookie(GOOGLE_OAUTH_BRIDGE_ATTEMPT_COOKIE_NAME, attempt, {
+    httpOnly: true,
+    secure: COOKIE_SECURE,
+    sameSite: COOKIE_SAMESITE,
+    domain: COOKIE_DOMAIN,
+    maxAge: GOOGLE_OAUTH_BRIDGE_ATTEMPT_TTL_SECONDS * 1000,
+    path: "/",
+  });
+}
+
+function clearBridgeAttemptCookie(res) {
+  res.clearCookie(GOOGLE_OAUTH_BRIDGE_ATTEMPT_COOKIE_NAME, {
+    httpOnly: true,
+    secure: COOKIE_SECURE,
+    sameSite: COOKIE_SAMESITE,
+    domain: COOKIE_DOMAIN,
+    path: "/",
+  });
 }
 
 router.post("/api/login", async (req, res) => {
@@ -204,188 +227,166 @@ router.post("/api/auth/google", async (req, res) => {
       audience: GOOGLE_CLIENT_ID,
     });
     const googleProfile = ticket.getPayload();
-    const email = String(googleProfile?.email || "").trim().toLowerCase();
-    const googleSubject = String(googleProfile?.sub || "").trim();
-
-    if (!email || !googleSubject || googleProfile?.email_verified !== true) {
-      return res.status(401).json({
-        ok: false,
-        message: "La cuenta de Google no tiene un correo verificado.",
-      });
-    }
-
-    if (
-      GOOGLE_ALLOWED_EMAIL_DOMAIN &&
-      email.split("@").pop() !== GOOGLE_ALLOWED_EMAIL_DOMAIN
-    ) {
-      return res.status(403).json({
-        ok: false,
-        message: `Debes utilizar una cuenta de ${GOOGLE_ALLOWED_EMAIL_DOMAIN}.`,
-      });
-    }
-
-    const { firstName, lastName } = getGoogleProfileNames(googleProfile, email);
-    const userResult = await withTransaction(async (tx) => {
-      const existingResult = await tx.query(
-        `SELECT
-           u.id,
-           u.email,
-           u.first_name,
-           u.last_name,
-           u.student_id,
-           u.career_id,
-           u.status,
-           u.oauth_provider,
-           u.oauth_subject,
-           c.name AS career_name,
-           c.faculty AS career_faculty,
-           m.role::text AS role
-         FROM users u
-         LEFT JOIN careers c ON c.id = u.career_id
-         LEFT JOIN memberships m
-           ON m.user_id = u.id
-          AND m.org_id = $3
-         WHERE (u.oauth_provider = 'google' AND u.oauth_subject = $1)
-            OR u.email = $2
-         ORDER BY CASE
-           WHEN u.oauth_provider = 'google' AND u.oauth_subject = $1 THEN 0
-           ELSE 1
-         END
-         LIMIT 1
-         FOR UPDATE OF u`,
-        [googleSubject, email, DEFAULT_ORG_ID],
-      );
-
-      let user = existingResult.rows?.[0] || null;
-
-      if (user?.status && user.status !== "active") {
-        return { disabled: true };
-      }
-
-      if (
-        user?.oauth_subject &&
-        (user.oauth_provider !== "google" || user.oauth_subject !== googleSubject)
-      ) {
-        return { oauthConflict: true };
-      }
-
-      if (user) {
-        await tx.query(
-          `UPDATE users
-           SET oauth_provider = 'google',
-               oauth_subject = $2,
-               email_verified_at = COALESCE(email_verified_at, now()),
-               updated_at = now()
-           WHERE id = $1`,
-          [user.id, googleSubject],
-        );
-
-        if (!user.role) {
-          await tx.query(
-            `INSERT INTO memberships (org_id, user_id, role)
-             VALUES ($1, $2, $3::membership_role)
-             ON CONFLICT (org_id, user_id) DO NOTHING`,
-            [DEFAULT_ORG_ID, user.id, ROLES.VISITOR],
-          );
-        }
-      } else {
-        const passwordHash = await bcrypt.hash(crypto.randomBytes(32).toString("hex"), 12);
-        const createdResult = await tx.query(
-          `INSERT INTO users (
-             email,
-             password_hash,
-             first_name,
-             last_name,
-             email_verified_at,
-             oauth_provider,
-             oauth_subject,
-             attributes
-           )
-           VALUES ($1, $2, $3, $4, now(), 'google', $5, $6::jsonb)
-           RETURNING id`,
-          [
-            email,
-            passwordHash,
-            firstName,
-            lastName,
-            googleSubject,
-            JSON.stringify({ google_picture: googleProfile?.picture || null }),
-          ],
-        );
-
-        await tx.query(
-          `INSERT INTO memberships (org_id, user_id, role)
-           VALUES ($1, $2, $3::membership_role)`,
-          [DEFAULT_ORG_ID, createdResult.rows[0].id, ROLES.VISITOR],
-        );
-
-        user = { id: createdResult.rows[0].id };
-      }
-
-      const authenticatedResult = await tx.query(
-        `SELECT
-           u.id,
-           u.email,
-           u.first_name,
-           u.last_name,
-           u.student_id,
-           u.career_id,
-           u.status,
-           c.name AS career_name,
-           c.faculty AS career_faculty,
-           m.role::text AS role
-         FROM users u
-         LEFT JOIN careers c ON c.id = u.career_id
-         JOIN memberships m
-           ON m.user_id = u.id
-          AND m.org_id = $2
-         WHERE u.id = $1
-         LIMIT 1`,
-        [user.id, DEFAULT_ORG_ID],
-      );
-
-      return { user: authenticatedResult.rows?.[0] || null };
+    const user = await authenticateGoogleIdentity({
+      subject: googleProfile?.sub,
+      email: googleProfile?.email,
+      emailVerified: googleProfile?.email_verified === true,
+      givenName: googleProfile?.given_name,
+      familyName: googleProfile?.family_name,
+      name: googleProfile?.name,
+      picture: googleProfile?.picture,
     });
-
-    if (userResult.disabled) {
-      return res.status(403).json({
-        ok: false,
-        message: "El usuario se encuentra deshabilitado. Consulta a un administrador.",
-      });
-    }
-
-    if (userResult.oauthConflict) {
-      return res.status(409).json({
-        ok: false,
-        message: "El correo ya está vinculado con otra cuenta de acceso.",
-      });
-    }
-
-    if (!userResult.user) {
-      throw new Error("No se pudo recuperar el usuario autenticado con Google.");
-    }
-
-    const sessionId = await createAuthenticatedSession(redis, userResult.user);
+    const sessionId = await createAuthenticatedSession(redis, user);
     setSessionCookie(res, sessionId);
 
     return res.status(200).json({
       ok: true,
       message: "Login con Google correcto.",
-      user: safeUserPayload(userResult.user),
-      role: userResult.user.role,
+      user: safeUserPayload(user),
+      role: user.role,
     });
   } catch (err) {
-    if (err?.code === "23505") {
-      return res.status(409).json({
+    if (err instanceof GoogleIdentityError) {
+      return res.status(err.status).json({
         ok: false,
-        message: "La cuenta de Google ya está vinculada con otro usuario.",
+        code: err.code,
+        message: err.message,
       });
     }
 
-    console.error("Error en /api/auth/google:", err.message);
+    console.error("Error en /api/auth/google:", err?.code || err?.name || "unknown_error");
     return res.status(401).json({
       ok: false,
       message: "No se pudo validar el acceso con Google. Intenta nuevamente.",
+    });
+  }
+});
+
+router.post("/api/auth/google/bridge/start", async (_req, res) => {
+  try {
+    const redis = getRedisClient();
+    if (!redis) {
+      return res.status(503).json({ ok: false, message: "Redis no está listo." });
+    }
+
+    const attempt = crypto.randomBytes(32).toString("base64url");
+    const expiresAt =
+      Math.floor(Date.now() / 1000) + GOOGLE_OAUTH_BRIDGE_ATTEMPT_TTL_SECONDS;
+    const authorizationUrl = buildGoogleBridgeAuthorizationUrl({ attempt, expiresAt });
+
+    await redis.set(
+      bridgeAttemptKey(attempt),
+      JSON.stringify({ createdAt: Date.now(), expiresAt }),
+      { EX: GOOGLE_OAUTH_BRIDGE_ATTEMPT_TTL_SECONDS },
+    );
+    setBridgeAttemptCookie(res, attempt);
+
+    return res.status(200).json({
+      ok: true,
+      authorization_url: authorizationUrl,
+      expires_in: GOOGLE_OAUTH_BRIDGE_ATTEMPT_TTL_SECONDS,
+    });
+  } catch (err) {
+    const status = err instanceof GoogleOAuthBridgeError ? err.status : 500;
+    console.error(
+      "Error en /api/auth/google/bridge/start:",
+      err?.code || err?.name || "unknown_error",
+    );
+    return res.status(status).json({
+      ok: false,
+      code: err?.code || "bridge_start_failed",
+      message:
+        err instanceof GoogleOAuthBridgeError
+          ? err.message
+          : "No se pudo iniciar el acceso con Google.",
+    });
+  }
+});
+
+router.post("/api/auth/google/bridge/complete", async (req, res) => {
+  const code = String(req.body?.code || "").trim();
+  const attempt = String(
+    req.cookies?.[GOOGLE_OAUTH_BRIDGE_ATTEMPT_COOKIE_NAME] || "",
+  ).trim();
+
+  if (!code || !attempt) {
+    clearBridgeAttemptCookie(res);
+    return res.status(400).json({
+      ok: false,
+      code: "invalid_bridge_callback",
+      message: "El retorno de Google no contiene un intento de acceso válido.",
+    });
+  }
+
+  let attemptClaimed = false;
+
+  try {
+    const redis = getRedisClient();
+    if (!redis) {
+      return res.status(503).json({ ok: false, message: "Redis no está listo." });
+    }
+
+    const attemptKey = bridgeAttemptKey(attempt);
+    const storedAttempt = await redis.getDel(attemptKey);
+    if (!storedAttempt) {
+      clearBridgeAttemptCookie(res);
+      return res.status(410).json({
+        ok: false,
+        code: "bridge_attempt_expired",
+        message: "El intento de acceso expiró. Inicia sesión nuevamente.",
+      });
+    }
+    attemptClaimed = true;
+
+    let attemptData;
+    try {
+      attemptData = JSON.parse(storedAttempt);
+    } catch {
+      attemptData = null;
+    }
+    if (
+      !Number.isFinite(attemptData?.expiresAt) ||
+      attemptData.expiresAt <= Math.floor(Date.now() / 1000)
+    ) {
+      clearBridgeAttemptCookie(res);
+      return res.status(410).json({
+        ok: false,
+        code: "bridge_attempt_expired",
+        message: "El intento de acceso expiró. Inicia sesión nuevamente.",
+      });
+    }
+
+    const identity = await redeemGoogleBridgeCode({ code, attempt });
+    const user = await authenticateGoogleIdentity(identity);
+    const sessionId = await createAuthenticatedSession(redis, user);
+
+    clearBridgeAttemptCookie(res);
+    setSessionCookie(res, sessionId);
+
+    return res.status(200).json({
+      ok: true,
+      message: "Login con Google correcto.",
+      user: safeUserPayload(user),
+      role: user.role,
+    });
+  } catch (err) {
+    const isKnownError =
+      err instanceof GoogleOAuthBridgeError || err instanceof GoogleIdentityError;
+
+    if (attemptClaimed) {
+      clearBridgeAttemptCookie(res);
+    }
+
+    console.error(
+      "Error en /api/auth/google/bridge/complete:",
+      err?.code || err?.name || "unknown_error",
+    );
+    return res.status(isKnownError ? err.status : 500).json({
+      ok: false,
+      code: err?.code || "bridge_complete_failed",
+      message: isKnownError
+        ? err.message
+        : "No se pudo completar el acceso con Google. Intenta nuevamente.",
     });
   }
 });

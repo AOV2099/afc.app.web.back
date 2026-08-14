@@ -1,0 +1,23 @@
+{
+    "name": "afc/google-oauth-https-bridge",
+    "description": "Intermediario HTTPS temporal para Google OAuth",
+    "type": "project",
+    "license": "proprietary",
+    "require": {
+        "php": "^8.1",
+        "ext-json": "*",
+        "ext-openssl": "*",
+        "ext-pdo": "*",
+        "ext-pdo_mysql": "*",
+        "google/apiclient": "^2.18"
+    },
+    "autoload": {
+        "psr-4": {
+            "Afc\\OAuthBridge\\": "src/"
+        }
+    },
+    "config": {
+        "optimize-autoloader": true,
+        "sort-packages": true
+    }
+}

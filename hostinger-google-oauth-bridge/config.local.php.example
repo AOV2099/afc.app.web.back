@@ -1,0 +1,27 @@
+<?php
+
+declare(strict_types=1);
+
+/*
+ * Copia este archivo como config.local.php y sustituye los valores.
+ * config.local.php debe permanecer FUERA de public_html y nunca debe subirse a Git.
+ */
+return [
+    'BRIDGE_GOOGLE_CLIENT_ID' => 'REEMPLAZAR_CLIENT_ID',
+    'BRIDGE_GOOGLE_CLIENT_SECRET' => 'REEMPLAZAR_CLIENT_SECRET',
+    'BRIDGE_GOOGLE_REDIRECT_URI' => 'https://bridge.example.com/auth/google/callback',
+    'BRIDGE_APP_CALLBACK_URL' => 'http://app.example.com/auth/callback',
+
+    'BRIDGE_SHARED_SECRET' => 'REEMPLAZAR_CON_SECRETO_ALEATORIO_DE_32_O_MAS_CARACTERES',
+
+    'BRIDGE_DB_HOST' => 'localhost',
+    'BRIDGE_DB_PORT' => 3306,
+    'BRIDGE_DB_NAME' => 'REEMPLAZAR_BASE',
+    'BRIDGE_DB_USER' => 'REEMPLAZAR_USUARIO',
+    'BRIDGE_DB_PASSWORD' => 'REEMPLAZAR_PASSWORD',
+
+    'BRIDGE_CODE_TTL_SECONDS' => 45,
+    'BRIDGE_STATE_TTL_SECONDS' => 300,
+    'BRIDGE_SIGNATURE_TOLERANCE_SECONDS' => 60,
+    'BRIDGE_HTTP_TIMEOUT_SECONDS' => 10,
+];

@@ -26,9 +26,18 @@ final class Config
 
     public static function fromEnvironment(): self
     {
-        $googleRedirectUri = self::requireUrl('BRIDGE_GOOGLE_REDIRECT_URI', true);
-        $appCallbackUrl = self::requireUrl('BRIDGE_APP_CALLBACK_URL', false);
-        $sharedSecret = self::requireEnvironment('BRIDGE_SHARED_SECRET');
+        $privateConfig = self::loadPrivateConfig();
+        $googleRedirectUri = self::requireUrl(
+            'BRIDGE_GOOGLE_REDIRECT_URI',
+            true,
+            $privateConfig,
+        );
+        $appCallbackUrl = self::requireUrl(
+            'BRIDGE_APP_CALLBACK_URL',
+            false,
+            $privateConfig,
+        );
+        $sharedSecret = self::requireSetting('BRIDGE_SHARED_SECRET', $privateConfig);
 
         if (strlen($sharedSecret) < 32) {
             throw new BridgeException(
@@ -39,30 +48,68 @@ final class Config
         }
 
         return new self(
-            self::requireEnvironment('BRIDGE_GOOGLE_CLIENT_ID'),
-            self::requireEnvironment('BRIDGE_GOOGLE_CLIENT_SECRET'),
+            self::requireSetting('BRIDGE_GOOGLE_CLIENT_ID', $privateConfig),
+            self::requireSetting('BRIDGE_GOOGLE_CLIENT_SECRET', $privateConfig),
             $googleRedirectUri,
             $appCallbackUrl,
             $sharedSecret,
-            self::requireEnvironment('BRIDGE_DB_HOST'),
-            self::boundedInteger('BRIDGE_DB_PORT', 3306, 1, 65535),
-            self::requireEnvironment('BRIDGE_DB_NAME'),
-            self::requireEnvironment('BRIDGE_DB_USER'),
-            self::requireEnvironment('BRIDGE_DB_PASSWORD'),
-            self::boundedInteger('BRIDGE_CODE_TTL_SECONDS', 45, 30, 60),
-            self::boundedInteger('BRIDGE_STATE_TTL_SECONDS', 300, 60, 600),
-            self::boundedInteger('BRIDGE_SIGNATURE_TOLERANCE_SECONDS', 60, 30, 300),
-            self::boundedInteger('BRIDGE_HTTP_TIMEOUT_SECONDS', 10, 3, 30),
+            self::requireSetting('BRIDGE_DB_HOST', $privateConfig),
+            self::boundedInteger('BRIDGE_DB_PORT', 3306, 1, 65535, $privateConfig),
+            self::requireSetting('BRIDGE_DB_NAME', $privateConfig),
+            self::requireSetting('BRIDGE_DB_USER', $privateConfig),
+            self::requireSetting('BRIDGE_DB_PASSWORD', $privateConfig),
+            self::boundedInteger('BRIDGE_CODE_TTL_SECONDS', 45, 30, 60, $privateConfig),
+            self::boundedInteger('BRIDGE_STATE_TTL_SECONDS', 300, 60, 600, $privateConfig),
+            self::boundedInteger(
+                'BRIDGE_SIGNATURE_TOLERANCE_SECONDS',
+                60,
+                30,
+                300,
+                $privateConfig,
+            ),
+            self::boundedInteger('BRIDGE_HTTP_TIMEOUT_SECONDS', 10, 3, 30, $privateConfig),
         );
     }
 
-    private static function requireEnvironment(string $name): string
+    /** @return array<string, scalar|null> */
+    private static function loadPrivateConfig(): array
     {
-        $value = trim((string) getenv($name));
+        $path = dirname(__DIR__) . '/config.local.php';
+        if (!is_file($path)) {
+            return [];
+        }
+
+        $config = require $path;
+        if (!is_array($config)) {
+            throw new BridgeException(
+                'configuration_error',
+                'config.local.php debe retornar un arreglo de configuración.',
+                500,
+            );
+        }
+
+        return $config;
+    }
+
+    /** @param array<string, scalar|null> $privateConfig */
+    private static function setting(string $name, array $privateConfig): string
+    {
+        $environmentValue = getenv($name);
+        if ($environmentValue !== false && trim((string) $environmentValue) !== '') {
+            return trim((string) $environmentValue);
+        }
+
+        return trim((string) ($privateConfig[$name] ?? ''));
+    }
+
+    /** @param array<string, scalar|null> $privateConfig */
+    private static function requireSetting(string $name, array $privateConfig): string
+    {
+        $value = self::setting($name, $privateConfig);
         if ($value === '') {
             throw new BridgeException(
                 'configuration_error',
-                sprintf('Falta la variable de entorno %s.', $name),
+                sprintf('Falta la configuración privada %s.', $name),
                 500,
             );
         }
@@ -70,9 +117,14 @@ final class Config
         return $value;
     }
 
-    private static function requireUrl(string $name, bool $httpsOnly): string
+    /** @param array<string, scalar|null> $privateConfig */
+    private static function requireUrl(
+        string $name,
+        bool $httpsOnly,
+        array $privateConfig,
+    ): string
     {
-        $value = rtrim(self::requireEnvironment($name), '/');
+        $value = rtrim(self::requireSetting($name, $privateConfig), '/');
         $parts = parse_url($value);
         $scheme = strtolower((string) ($parts['scheme'] ?? ''));
 
@@ -91,9 +143,16 @@ final class Config
         return $value;
     }
 
-    private static function boundedInteger(string $name, int $default, int $minimum, int $maximum): int
+    /** @param array<string, scalar|null> $privateConfig */
+    private static function boundedInteger(
+        string $name,
+        int $default,
+        int $minimum,
+        int $maximum,
+        array $privateConfig,
+    ): int
     {
-        $raw = trim((string) getenv($name));
+        $raw = self::setting($name, $privateConfig);
         if ($raw === '') {
             return $default;
         }

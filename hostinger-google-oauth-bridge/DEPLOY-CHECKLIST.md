@@ -30,8 +30,8 @@
   - [ ] PDO MySQL.
   - [ ] cURL.
 - [ ] Confirmar que el hosting permite reglas `.htaccess` y `mod_rewrite`.
-- [ ] Confirmar cómo se configuran variables de entorno para PHP.
-- [ ] Si Hostinger no permite variables de entorno, detener el despliegue y solicitar una configuración privada fuera de `public_html`. No colocar secretos en archivos públicos.
+- [ ] Confirmar si Hostinger permite variables de entorno para PHP.
+- [ ] Si no las permite, utilizar `config.local.php` en la raíz privada del proyecto, fuera de `public_html`.
 - [ ] Confirmar que el servidor puede realizar conexiones HTTPS salientes hacia Google.
 
 **Punto de control:** no continuar si el certificado HTTPS, PHP 8.1+, PDO MySQL o la configuración privada de variables no están disponibles.
@@ -74,6 +74,7 @@ Usar una estructura equivalente a:
 directorio-del-subdominio/
 ├── src/
 ├── vendor/
+├── config.local.php
 ├── composer.json
 ├── composer.lock
 └── public_html/
@@ -82,6 +83,7 @@ directorio-del-subdominio/
 ```
 
 - [ ] Subir `src/`, `vendor/`, `composer.json` y `composer.lock` fuera de `public_html`.
+- [ ] Copiar `config.local.php.example` como `config.local.php` fuera de `public_html`.
 - [ ] Subir únicamente el contenido de `public/` dentro de `public_html`.
 - [ ] Confirmar que `index.php` queda directamente dentro de `public_html`.
 - [ ] Confirmar que `.htaccess` queda directamente dentro de `public_html`.
@@ -113,9 +115,23 @@ directorio-del-subdominio/
 
 ---
 
-## Fase 5 — Configurar variables privadas en Hostinger
+## Fase 5 — Configurar los datos privados en Hostinger
 
-Configurar las siguientes variables mediante el mecanismo privado del proceso PHP. Sustituir los valores sin escribirlos en este documento:
+Para este despliegue directo, abrir el archivo privado `config.local.php`, ubicado junto a `src/` y `vendor/`, y completar el arreglo usando `config.local.php.example` como plantilla.
+
+La ubicación correcta es:
+
+```text
+directorio-del-subdominio/config.local.php
+```
+
+La ubicación incorrecta es:
+
+```text
+directorio-del-subdominio/public_html/config.local.php
+```
+
+Los nombres que debe completar son:
 
 ```dotenv
 BRIDGE_GOOGLE_CLIENT_ID=<client-id>
@@ -142,6 +158,9 @@ BRIDGE_HTTP_TIMEOUT_SECONDS=10
 - [ ] `BRIDGE_APP_CALLBACK_URL` termina exactamente en `/auth/callback`.
 - [ ] `BRIDGE_SHARED_SECRET` tiene como mínimo 32 caracteres aleatorios.
 - [ ] El secreto compartido no es el mismo que el Client Secret de Google.
+- [ ] `config.local.php` está junto a `src/` y `vendor/`, fuera de `public_html`.
+- [ ] Asignar a `config.local.php` permisos `600`; si el hosting no lo permite, usar `640`.
+- [ ] Confirmar desde el navegador que `/config.local.php` devuelve 404 o 403 y nunca su contenido.
 - [ ] Ningún secreto quedó dentro de `public_html`.
 - [ ] Reiniciar PHP o el sitio desde hPanel si el proveedor lo requiere para aplicar variables.
 

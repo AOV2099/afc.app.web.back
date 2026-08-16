@@ -23,7 +23,14 @@ El bridge nunca redirige tokens de Google hacia la aplicación. Entrega solament
 
 ## Variables del bridge PHP
 
-Todas son variables del proceso PHP; no crear ni publicar un archivo `.env` dentro del sitio.
+El bridge acepta variables del proceso PHP. Para un hosting compartido sin contenedores también puede utilizar `config.local.php` en la raíz privada del proyecto, siempre fuera de `public_html`.
+
+1. Copiar `config.local.php.example` como `config.local.php`.
+2. Escribir ahí las credenciales de Google y MySQL.
+3. Mantenerlo junto a `src/` y `vendor/`, nunca dentro de `public/` o `public_html`.
+4. Asignarle permisos `600` o, si Hostinger no lo permite, `640`.
+
+Las variables del proceso tienen prioridad sobre los valores de `config.local.php`. El archivo real está ignorado por Git y no debe enviarse dentro del ZIP.
 
 | Variable | Requerida | Descripción |
 | --- | --- | --- |

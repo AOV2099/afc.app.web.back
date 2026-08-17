@@ -11,6 +11,7 @@ return [
     'BRIDGE_GOOGLE_CLIENT_SECRET' => 'REEMPLAZAR_CLIENT_SECRET',
     'BRIDGE_GOOGLE_REDIRECT_URI' => 'https://bridge.example.com/auth/google/callback',
     'BRIDGE_APP_CALLBACK_URL' => 'http://app.example.com/auth/callback',
+    'BRIDGE_BASE_PATH' => '/afcloginbrige',
 
     'BRIDGE_SHARED_SECRET' => 'REEMPLAZAR_CON_SECRETO_ALEATORIO_DE_32_O_MAS_CARACTERES',
 

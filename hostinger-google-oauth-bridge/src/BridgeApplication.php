@@ -21,6 +21,14 @@ final class BridgeApplication
         $this->securityHeaders();
         $path = (string) parse_url($_SERVER['REQUEST_URI'] ?? '/', PHP_URL_PATH);
 
+        if ($this->config->basePath !== '') {
+            if ($path === $this->config->basePath) {
+                $path = '/';
+            } elseif (str_starts_with($path, $this->config->basePath . '/')) {
+                $path = substr($path, strlen($this->config->basePath));
+            }
+        }
+
         try {
             match ($path) {
                 '/auth/google/start' => $this->handleStart(),

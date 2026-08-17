@@ -11,6 +11,7 @@ final class Config
         public readonly string $googleClientSecret,
         public readonly string $googleRedirectUri,
         public readonly string $appCallbackUrl,
+        public readonly string $basePath,
         public readonly string $sharedSecret,
         public readonly string $dbHost,
         public readonly int $dbPort,
@@ -52,6 +53,7 @@ final class Config
             self::requireSetting('BRIDGE_GOOGLE_CLIENT_SECRET', $privateConfig),
             $googleRedirectUri,
             $appCallbackUrl,
+            self::normalizeBasePath(self::setting('BRIDGE_BASE_PATH', $privateConfig)),
             $sharedSecret,
             self::requireSetting('BRIDGE_DB_HOST', $privateConfig),
             self::boundedInteger('BRIDGE_DB_PORT', 3306, 1, 65535, $privateConfig),
@@ -141,6 +143,27 @@ final class Config
         }
 
         return $value;
+    }
+
+    private static function normalizeBasePath(string $value): string
+    {
+        $basePath = '/' . trim($value, '/');
+        if ($basePath === '/') {
+            return '';
+        }
+
+        if (
+            str_contains($basePath, '..') ||
+            !preg_match('#^/[A-Za-z0-9._~!$&\'()*+,;=:@%/-]+$#', $basePath)
+        ) {
+            throw new BridgeException(
+                'configuration_error',
+                'BRIDGE_BASE_PATH no contiene una ruta válida.',
+                500,
+            );
+        }
+
+        return $basePath;
     }
 
     /** @param array<string, scalar|null> $privateConfig */

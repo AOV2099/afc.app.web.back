@@ -1,5 +1,6 @@
 /vendor/
 config.local.php
+/public/bridge-root.php
 /.phpunit.cache/
 /.env
 /.env.*

@@ -1,0 +1,10 @@
+<?php
+
+declare(strict_types=1);
+
+/*
+ * Copia este archivo como bridge-root.php dentro de public_html/afcloginbrige.
+ * La ruta resultante debe apuntar a la carpeta privada que contiene src/, vendor/
+ * y config.local.php. Este archivo no contiene credenciales.
+ */
+return dirname(__DIR__, 2) . '/afcloginbridge-private';

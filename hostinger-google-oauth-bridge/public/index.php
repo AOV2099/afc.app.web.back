@@ -15,7 +15,16 @@ header('Cache-Control: no-store, max-age=0');
 header('X-Content-Type-Options: nosniff');
 date_default_timezone_set('UTC');
 
-$autoload = dirname(__DIR__) . '/vendor/autoload.php';
+$appRoot = dirname(__DIR__);
+$rootConfigPath = __DIR__ . '/bridge-root.php';
+if (is_file($rootConfigPath)) {
+    $configuredRoot = require $rootConfigPath;
+    if (is_string($configuredRoot) && trim($configuredRoot) !== '') {
+        $appRoot = rtrim(trim($configuredRoot), '/');
+    }
+}
+
+$autoload = $appRoot . '/vendor/autoload.php';
 if (!is_file($autoload)) {
     error_log('{"service":"afc-google-oauth-bridge","event":"bootstrap","outcome":"failed","error_code":"dependencies_missing"}');
     http_response_code(500);

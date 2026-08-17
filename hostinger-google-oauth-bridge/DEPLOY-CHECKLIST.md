@@ -72,22 +72,27 @@ Usar una estructura equivalente a:
 
 ```text
 directorio-del-subdominio/
-├── src/
-├── vendor/
-├── config.local.php
-├── composer.json
-├── composer.lock
+├── afcloginbridge-private/
+│   ├── src/
+│   ├── vendor/
+│   ├── config.local.php
+│   ├── composer.json
+│   └── composer.lock
 └── public_html/
+  └── afcloginbrige/
     ├── index.php
-    └── .htaccess
+    ├── .htaccess
+    └── bridge-root.php
 ```
 
-- [ ] Subir `src/`, `vendor/`, `composer.json` y `composer.lock` fuera de `public_html`.
-- [ ] Copiar `config.local.php.example` como `config.local.php` fuera de `public_html`.
-- [ ] Subir únicamente el contenido de `public/` dentro de `public_html`.
-- [ ] Confirmar que `index.php` queda directamente dentro de `public_html`.
-- [ ] Confirmar que `.htaccess` queda directamente dentro de `public_html`.
-- [ ] Verificar que la ruta de `index.php` hacia `../vendor/autoload.php` coincide con la estructura final.
+- [ ] Crear `afcloginbridge-private` fuera de `public_html`.
+- [ ] Subir `src/`, `vendor/`, `composer.json` y `composer.lock` dentro de `afcloginbridge-private`.
+- [ ] Copiar `config.local.php.example` como `afcloginbridge-private/config.local.php`.
+- [ ] Subir el contenido de `public/` dentro de `public_html/afcloginbrige`.
+- [ ] Copiar `bridge-root.php.example` como `public_html/afcloginbrige/bridge-root.php`.
+- [ ] Editar `bridge-root.php` para que retorne la ruta absoluta o relativa correcta de `afcloginbridge-private`.
+- [ ] Confirmar que `index.php` y `.htaccess` quedan directamente dentro de `public_html/afcloginbrige`.
+- [ ] Confirmar desde el navegador que `/afcloginbrige/bridge-root.php` devuelve 403.
 
 ### Permisos
 
@@ -138,6 +143,7 @@ BRIDGE_GOOGLE_CLIENT_ID=<client-id>
 BRIDGE_GOOGLE_CLIENT_SECRET=<client-secret>
 BRIDGE_GOOGLE_REDIRECT_URI=https://<dominio-bridge>/auth/google/callback
 BRIDGE_APP_CALLBACK_URL=http://ecosistemadigital.aragon.unam.mx:3005/auth/callback
+BRIDGE_BASE_PATH=/afcloginbrige
 
 BRIDGE_SHARED_SECRET=<secreto-hmac-de-32-o-mas-caracteres>
 
@@ -186,7 +192,7 @@ https://<dominio-bridge>/auth/google/callback
 
 ## Fase 7 — Probar solamente el bridge
 
-- [ ] Abrir `https://<dominio-bridge>/health`.
+- [ ] Abrir `https://vinculacionydesarrollo.net/afcloginbrige/health`.
 - [ ] Confirmar HTTP `200`.
 - [ ] Confirmar una respuesta equivalente a:
 

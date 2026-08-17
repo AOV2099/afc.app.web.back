@@ -18,6 +18,7 @@ El bridge nunca redirige tokens de Google hacia la aplicación. Entrega solament
 - Configurar `public/` como document root del dominio o subdominio HTTPS.
 - Mantener `src/`, `vendor/` y `database/` fuera del document root.
 - Si Hostinger no permite seleccionar `public/` como document root, colocar el proyecto fuera de `public_html` y publicar únicamente el contenido de `public/`, ajustando la ruta a `vendor/autoload.php`.
+- Para una carpeta pública como `public_html/afcloginbrige`, copiar `public/bridge-root.php.example` como `bridge-root.php` y hacer que retorne la ruta de `afcloginbridge-private`. No contiene secretos y `.htaccess` bloquea su acceso web.
 - Ejecutar `composer install --no-dev --optimize-autoloader` antes de subir el módulo o mediante SSH en Hostinger.
 - Importar `database/schema.sql` en una base MySQL/MariaDB exclusiva o en un esquema con permisos limitados.
 
@@ -38,6 +39,7 @@ Las variables del proceso tienen prioridad sobre los valores de `config.local.ph
 | `BRIDGE_GOOGLE_CLIENT_SECRET` | Sí | Secreto OAuth; permanece únicamente en Hostinger. |
 | `BRIDGE_GOOGLE_REDIRECT_URI` | Sí | Callback HTTPS exacto, por ejemplo `https://bridge.example.com/auth/google/callback`. |
 | `BRIDGE_APP_CALLBACK_URL` | Sí | Retorno fijo de la aplicación, por ejemplo `http://app.example.com/auth/callback`. |
+| `BRIDGE_BASE_PATH` | No | Prefijo URL cuando se publica en una carpeta, por ejemplo `/afcloginbrige`; vacío para un subdominio dedicado. |
 | `BRIDGE_SHARED_SECRET` | Sí | Secreto aleatorio compartido con el backend, mínimo 32 caracteres. |
 | `BRIDGE_DB_HOST` | Sí | Host de MySQL/MariaDB. |
 | `BRIDGE_DB_PORT` | No | Puerto; predeterminado `3306`. |
@@ -77,6 +79,10 @@ Cuando el servidor principal tenga HTTPS, cambiar a `PUBLIC_GOOGLE_AUTH_MODE=dir
 En el cliente OAuth de tipo aplicación web, registrar exactamente como URI de redireccionamiento autorizada:
 
 `https://bridge.example.com/auth/google/callback`
+
+Si se publica bajo una carpeta, registrar la ruta completa, por ejemplo:
+
+`https://vinculacionydesarrollo.net/afcloginbrige/auth/google/callback`
 
 No registrar la URL HTTP de la aplicación principal como redirect URI de Google. También se debe configurar la pantalla de consentimiento, dominio autorizado y usuarios de prueba si la aplicación sigue en modo Testing.
 

@@ -1,9 +1,11 @@
 Options -Indexes
 RewriteEngine On
 
-<Files "bridge-root.php">
+<FilesMatch "^(bridge-root\.php|config\.local\.php|config\.local\.php\.example|composer\.(json|lock)|README\.md|DEPLOY-CHECKLIST\.md)$">
     Require all denied
-</Files>
+</FilesMatch>
+
+RewriteRule ^(?:private|src|vendor|database)(?:/|$) - [F,L,NC]
 
 RewriteCond %{REQUEST_FILENAME} !-f
 RewriteCond %{REQUEST_FILENAME} !-d

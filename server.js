@@ -2,6 +2,12 @@ import "dotenv/config";
 import express from "express";
 import cors from "cors";
 import cookieParser from "cookie-parser";
+import {
+  ALLOWED_ORIGINS,
+  CORS_ALLOW_ANY_ORIGIN,
+  PUBLIC_URL,
+  TRUST_PROXY,
+} from "./src/config/appConfig.js";
 
 import { connectRedis, getRedisClient } from "./src/redisClient.js";
 import { connectPostgres, closePostgres } from "./src/postgresClient.js";
@@ -14,16 +20,26 @@ import alertsRoutes from "./src/routes/alertsRoutes.js";
 
 const app = express();
 const PORT = Number(process.env.PORT || 3000);
- 
+
+app.set("trust proxy", TRUST_PROXY);
+
+if (PUBLIC_URL && !TRUST_PROXY) {
+  console.error(
+    "PUBLIC_URL está configurada pero TRUST_PROXY está desactivado; OAuth HTTPS será rechazado.",
+  );
+}
+
+const allowedOrigins = new Set([
+  ...ALLOWED_ORIGINS,
+  ...(PUBLIC_URL ? [PUBLIC_URL] : []),
+]);
 const corsOptions = {
-  // Temporal: permitir cualquier origen.
-  origin: true,
-  // Lógica anterior de lista blanca (temporalmente deshabilitada):
-  // origin(origin, callback) {
-  //   if (!origin) return callback(null, true);
-  //   if (ALLOWED_ORIGINS.includes(origin)) return callback(null, true);
-  //   return callback(new Error("Origen no permitido por CORS"));
-  // },
+  origin(origin, callback) {
+    if (!origin || CORS_ALLOW_ANY_ORIGIN || allowedOrigins.has(origin)) {
+      return callback(null, true);
+    }
+    return callback(new Error("Origen no permitido por CORS"));
+  },
   credentials: true,
   optionsSuccessStatus: 200,
 };
@@ -90,6 +106,12 @@ async function startServer() {
 
   app.listen(PORT, () => {
     console.log(`Servidor Express escuchando en puerto ${PORT}`);
+    console.log(
+      `Gateway confiable: ${TRUST_PROXY || "desactivado"}; URL pública: ${PUBLIC_URL || "no configurada"}`,
+    );
+    if (CORS_ALLOW_ANY_ORIGIN) {
+      console.warn("CORS permite cualquier origen; usa CORS_ALLOW_ANY_ORIGIN=false en producción.");
+    }
   });
 }
 

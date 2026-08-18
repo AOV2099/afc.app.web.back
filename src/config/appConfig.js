@@ -12,6 +12,30 @@ export const COOKIE_SECURE = String(process.env.COOKIE_SECURE || "false") === "t
 export const COOKIE_SAMESITE = process.env.COOKIE_SAMESITE || "lax";
 export const COOKIE_DOMAIN = process.env.COOKIE_DOMAIN || undefined;
 
+export const PUBLIC_URL = String(process.env.PUBLIC_URL || "").trim().replace(/\/$/, "");
+export const GOOGLE_CALLBACK_URL = String(process.env.GOOGLE_CALLBACK_URL || "").trim();
+const googleOAuthStateTtl = Number(process.env.GOOGLE_OAUTH_STATE_TTL_SECONDS || 300);
+export const GOOGLE_OAUTH_STATE_TTL_SECONDS = Number.isFinite(googleOAuthStateTtl)
+  ? Math.min(600, Math.max(60, Math.trunc(googleOAuthStateTtl)))
+  : 300;
+export const GOOGLE_OAUTH_STATE_COOKIE_NAME =
+  process.env.GOOGLE_OAUTH_STATE_COOKIE_NAME || "afc_google_oauth_state";
+
+const healthcheckTimeout = Number(process.env.HEALTHCHECK_TIMEOUT_MS || 5000);
+export const HEALTHCHECK_TIMEOUT_MS = Number.isFinite(healthcheckTimeout)
+  ? Math.min(10_000, Math.max(500, Math.trunc(healthcheckTimeout)))
+  : 5000;
+
+const trustProxyRaw = String(process.env.TRUST_PROXY || "").trim();
+export const TRUST_PROXY = /^\d+$/.test(trustProxyRaw)
+  ? Number(trustProxyRaw)
+  : trustProxyRaw || false;
+const corsAllowAnyRaw = process.env.CORS_ALLOW_ANY_ORIGIN;
+export const CORS_ALLOW_ANY_ORIGIN =
+  corsAllowAnyRaw === undefined
+    ? process.env.NODE_ENV !== "production"
+    : String(corsAllowAnyRaw) === "true";
+
 export const GOOGLE_CLIENT_ID = String(process.env.GOOGLE_CLIENT_ID || "").trim();
 export const GOOGLE_CLIENT_SECRET = String(process.env.GOOGLE_CLIENT_SECRET || "").trim();
 export const GOOGLE_OAUTH_REDIRECT_URI =

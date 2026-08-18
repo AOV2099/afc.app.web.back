@@ -1,7 +1,7 @@
 import { Router } from "express";
 import crypto from "crypto";
 import bcrypt from "bcryptjs";
-import { OAuth2Client } from "google-auth-library";
+import { CodeChallengeMethod, OAuth2Client } from "google-auth-library";
 
 import { getRedisClient } from "../redisClient.js";
 import { query, withTransaction } from "../postgresClient.js";
@@ -10,23 +10,56 @@ import {
   COOKIE_SAMESITE,
   COOKIE_SECURE,
   DEFAULT_ORG_ID,
-  GOOGLE_ALLOWED_EMAIL_DOMAIN,
+  GOOGLE_CALLBACK_URL,
   GOOGLE_CLIENT_ID,
   GOOGLE_CLIENT_SECRET,
+  GOOGLE_OAUTH_STATE_COOKIE_NAME,
+  GOOGLE_OAUTH_STATE_TTL_SECONDS,
   GOOGLE_OAUTH_REDIRECT_URI,
+  PUBLIC_URL,
   SESSION_COOKIE_NAME,
   SESSION_TTL_SECONDS,
   ROLES,
 } from "../config/appConfig.js";
 import { requireAuth } from "../middleware/auth.js";
+import { createOAuthRateLimit } from "../middleware/oauthRateLimit.js";
 import { safeUserPayload, sessionKey } from "../utils/session.js";
+import {
+  authenticateGoogleIdentity,
+  GoogleIdentityError,
+} from "../services/googleIdentityService.js";
+import {
+  createGoogleOAuthState,
+  consumeGoogleOAuthState,
+  statesMatch,
+} from "../services/googleOAuthState.js";
+import {
+  PublicUrlConfigError,
+  resolveOAuthPublicConfig,
+  roleHomePath,
+  validatePublicProxyRequest,
+} from "../services/publicUrl.js";
 
 const router = Router();
+const limitDirectGoogleLogin = createOAuthRateLimit({
+  limit: 20,
+  windowMs: 60_000,
+  scope: "google-direct",
+});
+const limitGoogleStart = createOAuthRateLimit({
+  limit: 20,
+  windowMs: 60_000,
+  scope: "google-start",
+});
 
-function setSessionCookie(res, sessionId) {
+function shouldUseSecureCookie(req) {
+  return COOKIE_SECURE || Boolean(req.secure);
+}
+
+function setSessionCookie(req, res, sessionId) {
   res.cookie(SESSION_COOKIE_NAME, sessionId, {
     httpOnly: true,
-    secure: COOKIE_SECURE,
+    secure: shouldUseSecureCookie(req),
     sameSite: COOKIE_SAMESITE,
     domain: COOKIE_DOMAIN,
     maxAge: SESSION_TTL_SECONDS * 1000,
@@ -49,16 +82,32 @@ async function createAuthenticatedSession(redis, userRow) {
   return sessionId;
 }
 
-function getGoogleProfileNames(payload, email) {
-  const fullNameParts = String(payload?.name || "").trim().split(/\s+/).filter(Boolean);
-  const firstName =
-    String(payload?.given_name || "").trim() ||
-    fullNameParts.shift() ||
-    String(email).split("@")[0];
-  const lastName =
-    String(payload?.family_name || "").trim() || fullNameParts.join(" ") || "-";
+function clearOAuthStateCookie(res) {
+  res.clearCookie(GOOGLE_OAUTH_STATE_COOKIE_NAME, {
+    httpOnly: true,
+    secure: true,
+    sameSite: "lax",
+    domain: COOKIE_DOMAIN,
+    path: "/",
+  });
+}
 
-  return { firstName, lastName };
+function redirectOAuthError(res, publicOrigin, errorCode) {
+  const loginUrl = new URL("/login", publicOrigin);
+  loginUrl.searchParams.set("oauth_error", errorCode);
+  return res.redirect(302, loginUrl.toString());
+}
+
+function safeOAuthErrorCode(error) {
+  if (String(error?.response?.data?.error || "") === "redirect_uri_mismatch") {
+    return "redirect_uri_mismatch";
+  }
+  if (error instanceof GoogleIdentityError) {
+    if (error.code === "user_disabled") return "user_disabled";
+    if (error.code === "google_email_domain_forbidden") return "domain_forbidden";
+    if (error.code === "oauth_account_conflict") return "account_conflict";
+  }
+  return "google_error";
 }
 
 router.post("/api/login", async (req, res) => {
@@ -127,25 +176,8 @@ router.post("/api/login", async (req, res) => {
       return res.status(401).json({ ok: false, message: "Credenciales inválidas." });
     }
 
-    const sessionId = crypto.randomUUID();
-    const session = {
-      userId: userRow.id,
-      role: userRow.role,
-      createdAt: Date.now(),
-    };
-
-    await redis.set(sessionKey(sessionId), JSON.stringify(session), {
-      EX: SESSION_TTL_SECONDS,
-    });
-
-    res.cookie(SESSION_COOKIE_NAME, sessionId, {
-      httpOnly: true,
-      secure: COOKIE_SECURE,
-      sameSite: COOKIE_SAMESITE,
-      domain: COOKIE_DOMAIN,
-      maxAge: SESSION_TTL_SECONDS * 1000,
-      path: "/",
-    });
+    const sessionId = await createAuthenticatedSession(redis, userRow);
+    setSessionCookie(req, res, sessionId);
 
     return res.status(200).json({
       ok: true,
@@ -159,7 +191,7 @@ router.post("/api/login", async (req, res) => {
   }
 });
 
-router.post("/api/auth/google", async (req, res) => {
+router.post("/api/auth/google", limitDirectGoogleLogin, async (req, res) => {
   const code = String(req.body?.code || "").trim();
 
   if (!code) {
@@ -203,190 +235,189 @@ router.post("/api/auth/google", async (req, res) => {
       idToken: tokens.id_token,
       audience: GOOGLE_CLIENT_ID,
     });
-    const googleProfile = ticket.getPayload();
-    const email = String(googleProfile?.email || "").trim().toLowerCase();
-    const googleSubject = String(googleProfile?.sub || "").trim();
-
-    if (!email || !googleSubject || googleProfile?.email_verified !== true) {
-      return res.status(401).json({
-        ok: false,
-        message: "La cuenta de Google no tiene un correo verificado.",
-      });
-    }
-
-    if (
-      GOOGLE_ALLOWED_EMAIL_DOMAIN &&
-      email.split("@").pop() !== GOOGLE_ALLOWED_EMAIL_DOMAIN
-    ) {
-      return res.status(403).json({
-        ok: false,
-        message: `Debes utilizar una cuenta de ${GOOGLE_ALLOWED_EMAIL_DOMAIN}.`,
-      });
-    }
-
-    const { firstName, lastName } = getGoogleProfileNames(googleProfile, email);
-    const userResult = await withTransaction(async (tx) => {
-      const existingResult = await tx.query(
-        `SELECT
-           u.id,
-           u.email,
-           u.first_name,
-           u.last_name,
-           u.student_id,
-           u.career_id,
-           u.status,
-           u.oauth_provider,
-           u.oauth_subject,
-           c.name AS career_name,
-           c.faculty AS career_faculty,
-           m.role::text AS role
-         FROM users u
-         LEFT JOIN careers c ON c.id = u.career_id
-         LEFT JOIN memberships m
-           ON m.user_id = u.id
-          AND m.org_id = $3
-         WHERE (u.oauth_provider = 'google' AND u.oauth_subject = $1)
-            OR u.email = $2
-         ORDER BY CASE
-           WHEN u.oauth_provider = 'google' AND u.oauth_subject = $1 THEN 0
-           ELSE 1
-         END
-         LIMIT 1
-         FOR UPDATE OF u`,
-        [googleSubject, email, DEFAULT_ORG_ID],
-      );
-
-      let user = existingResult.rows?.[0] || null;
-
-      if (user?.status && user.status !== "active") {
-        return { disabled: true };
-      }
-
-      if (
-        user?.oauth_subject &&
-        (user.oauth_provider !== "google" || user.oauth_subject !== googleSubject)
-      ) {
-        return { oauthConflict: true };
-      }
-
-      if (user) {
-        await tx.query(
-          `UPDATE users
-           SET oauth_provider = 'google',
-               oauth_subject = $2,
-               email_verified_at = COALESCE(email_verified_at, now()),
-               updated_at = now()
-           WHERE id = $1`,
-          [user.id, googleSubject],
-        );
-
-        if (!user.role) {
-          await tx.query(
-            `INSERT INTO memberships (org_id, user_id, role)
-             VALUES ($1, $2, $3::membership_role)
-             ON CONFLICT (org_id, user_id) DO NOTHING`,
-            [DEFAULT_ORG_ID, user.id, ROLES.VISITOR],
-          );
-        }
-      } else {
-        const passwordHash = await bcrypt.hash(crypto.randomBytes(32).toString("hex"), 12);
-        const createdResult = await tx.query(
-          `INSERT INTO users (
-             email,
-             password_hash,
-             first_name,
-             last_name,
-             email_verified_at,
-             oauth_provider,
-             oauth_subject,
-             attributes
-           )
-           VALUES ($1, $2, $3, $4, now(), 'google', $5, $6::jsonb)
-           RETURNING id`,
-          [
-            email,
-            passwordHash,
-            firstName,
-            lastName,
-            googleSubject,
-            JSON.stringify({ google_picture: googleProfile?.picture || null }),
-          ],
-        );
-
-        await tx.query(
-          `INSERT INTO memberships (org_id, user_id, role)
-           VALUES ($1, $2, $3::membership_role)`,
-          [DEFAULT_ORG_ID, createdResult.rows[0].id, ROLES.VISITOR],
-        );
-
-        user = { id: createdResult.rows[0].id };
-      }
-
-      const authenticatedResult = await tx.query(
-        `SELECT
-           u.id,
-           u.email,
-           u.first_name,
-           u.last_name,
-           u.student_id,
-           u.career_id,
-           u.status,
-           c.name AS career_name,
-           c.faculty AS career_faculty,
-           m.role::text AS role
-         FROM users u
-         LEFT JOIN careers c ON c.id = u.career_id
-         JOIN memberships m
-           ON m.user_id = u.id
-          AND m.org_id = $2
-         WHERE u.id = $1
-         LIMIT 1`,
-        [user.id, DEFAULT_ORG_ID],
-      );
-
-      return { user: authenticatedResult.rows?.[0] || null };
-    });
-
-    if (userResult.disabled) {
-      return res.status(403).json({
-        ok: false,
-        message: "El usuario se encuentra deshabilitado. Consulta a un administrador.",
-      });
-    }
-
-    if (userResult.oauthConflict) {
-      return res.status(409).json({
-        ok: false,
-        message: "El correo ya está vinculado con otra cuenta de acceso.",
-      });
-    }
-
-    if (!userResult.user) {
-      throw new Error("No se pudo recuperar el usuario autenticado con Google.");
-    }
-
-    const sessionId = await createAuthenticatedSession(redis, userResult.user);
-    setSessionCookie(res, sessionId);
+    const user = await authenticateGoogleIdentity(ticket.getPayload());
+    const sessionId = await createAuthenticatedSession(redis, user);
+    setSessionCookie(req, res, sessionId);
 
     return res.status(200).json({
       ok: true,
       message: "Login con Google correcto.",
-      user: safeUserPayload(userResult.user),
-      role: userResult.user.role,
+      user: safeUserPayload(user),
+      role: user.role,
     });
   } catch (err) {
-    if (err?.code === "23505") {
-      return res.status(409).json({
+    if (err instanceof GoogleIdentityError) {
+      return res.status(err.status).json({
         ok: false,
-        message: "La cuenta de Google ya está vinculada con otro usuario.",
+        code: err.code,
+        message: err.message,
       });
     }
 
-    console.error("Error en /api/auth/google:", err.message);
+    console.error("Error en /api/auth/google:", err?.code || err?.name || "google_error");
     return res.status(401).json({
       ok: false,
       message: "No se pudo validar el acceso con Google. Intenta nuevamente.",
     });
+  }
+});
+
+router.get("/auth/google", limitGoogleStart, async (req, res) => {
+  try {
+    const config = resolveOAuthPublicConfig({
+      publicUrl: PUBLIC_URL,
+      googleCallbackUrl: GOOGLE_CALLBACK_URL,
+    });
+    validatePublicProxyRequest(req, config);
+
+    if (!GOOGLE_CLIENT_ID || !GOOGLE_CLIENT_SECRET) {
+      return res.status(503).json({
+        ok: false,
+        code: "google_not_configured",
+        message: "El inicio con Google aún no está configurado en el servidor.",
+      });
+    }
+
+    const redis = getRedisClient();
+    if (!redis) {
+      return res.status(503).json({ ok: false, message: "Redis no está listo." });
+    }
+
+    const oauthClient = new OAuth2Client(
+      GOOGLE_CLIENT_ID,
+      GOOGLE_CLIENT_SECRET,
+      config.callbackUrl,
+    );
+    const { state, codeChallenge } = await createGoogleOAuthState({
+      redis,
+      oauthClient,
+      ttlSeconds: GOOGLE_OAUTH_STATE_TTL_SECONDS,
+    });
+
+    res.cookie(GOOGLE_OAUTH_STATE_COOKIE_NAME, state, {
+      httpOnly: true,
+      secure: true,
+      sameSite: "lax",
+      domain: COOKIE_DOMAIN,
+      maxAge: GOOGLE_OAUTH_STATE_TTL_SECONDS * 1000,
+      path: "/",
+    });
+    res.set("Cache-Control", "no-store");
+
+    const authorizationUrl = oauthClient.generateAuthUrl({
+      access_type: "online",
+      prompt: "select_account",
+      scope: ["openid", "email", "profile"],
+      include_granted_scopes: true,
+      state,
+      redirect_uri: config.callbackUrl,
+      code_challenge: codeChallenge,
+      code_challenge_method: CodeChallengeMethod.S256,
+    });
+
+    console.info("Google OAuth iniciado", { host: config.publicHostname });
+    return res.redirect(302, authorizationUrl);
+  } catch (err) {
+    const status = err instanceof PublicUrlConfigError ? 503 : 500;
+    console.error("Error en /auth/google:", err?.code || err?.name || "oauth_start_error");
+    return res.status(status).json({
+      ok: false,
+      code: err?.code || "oauth_start_error",
+      message:
+        err instanceof PublicUrlConfigError
+          ? err.message
+          : "No se pudo iniciar el acceso con Google.",
+    });
+  }
+});
+
+router.get("/auth/google/callback", async (req, res) => {
+  res.set("Cache-Control", "no-store");
+  res.set("Referrer-Policy", "no-referrer");
+
+  let config;
+  try {
+    config = resolveOAuthPublicConfig({
+      publicUrl: PUBLIC_URL,
+      googleCallbackUrl: GOOGLE_CALLBACK_URL,
+    });
+    validatePublicProxyRequest(req, config);
+  } catch (err) {
+    clearOAuthStateCookie(res);
+    console.error(
+      "Error de proxy/configuración OAuth callback:",
+      err?.code || err?.name || "oauth_proxy_error",
+    );
+    return res.status(503).json({
+      ok: false,
+      code: err?.code || "oauth_proxy_error",
+      message: "La URL pública o el gateway HTTPS no están configurados correctamente.",
+    });
+  }
+
+  const queryState = String(req.query?.state || "").trim();
+  const cookieState = String(req.cookies?.[GOOGLE_OAUTH_STATE_COOKIE_NAME] || "").trim();
+  const googleError = String(req.query?.error || "").trim();
+  const code = String(req.query?.code || "").trim();
+  const redis = getRedisClient();
+
+  if (!redis) {
+    clearOAuthStateCookie(res);
+    return redirectOAuthError(res, config.publicOrigin, "session_error");
+  }
+  if (!statesMatch(cookieState, queryState)) {
+    clearOAuthStateCookie(res);
+    console.warn("Google OAuth callback rechazado", { code: "invalid_state" });
+    return redirectOAuthError(res, config.publicOrigin, "invalid_state");
+  }
+
+  const storedState = await consumeGoogleOAuthState({ redis, state: queryState });
+  clearOAuthStateCookie(res);
+  if (!storedState) {
+    console.warn("Google OAuth callback rechazado", { code: "invalid_state" });
+    return redirectOAuthError(res, config.publicOrigin, "invalid_state");
+  }
+  if (googleError) {
+    const errorCode = googleError === "access_denied" ? "access_denied" : "google_error";
+    console.warn("Google OAuth cancelado/rechazado", { code: errorCode });
+    return redirectOAuthError(res, config.publicOrigin, errorCode);
+  }
+  if (!code) {
+    return redirectOAuthError(res, config.publicOrigin, "invalid_callback");
+  }
+
+  try {
+    const oauthClient = new OAuth2Client(
+      GOOGLE_CLIENT_ID,
+      GOOGLE_CLIENT_SECRET,
+      config.callbackUrl,
+    );
+    const { tokens } = await oauthClient.getToken({
+      code,
+      codeVerifier: storedState.codeVerifier,
+      redirect_uri: config.callbackUrl,
+    });
+    if (!tokens.id_token) {
+      return redirectOAuthError(res, config.publicOrigin, "google_error");
+    }
+
+    const ticket = await oauthClient.verifyIdToken({
+      idToken: tokens.id_token,
+      audience: GOOGLE_CLIENT_ID,
+    });
+    const user = await authenticateGoogleIdentity(ticket.getPayload());
+    const sessionId = await createAuthenticatedSession(redis, user);
+    setSessionCookie(req, res, sessionId);
+
+    console.info("Google OAuth completado", { role: user.role });
+    return res.redirect(302, new URL(roleHomePath(user.role), config.publicOrigin).toString());
+  } catch (err) {
+    const errorCode = safeOAuthErrorCode(err);
+    console.error(
+      "Error en /auth/google/callback:",
+      err?.code || err?.name || errorCode,
+    );
+    return redirectOAuthError(res, config.publicOrigin, errorCode);
   }
 });
 
@@ -726,7 +757,7 @@ router.post("/api/logout", requireAuth, async (req, res) => {
 
   res.clearCookie(SESSION_COOKIE_NAME, {
     httpOnly: true,
-    secure: COOKIE_SECURE,
+    secure: shouldUseSecureCookie(req),
     sameSite: COOKIE_SAMESITE,
     domain: COOKIE_DOMAIN,
     path: "/",

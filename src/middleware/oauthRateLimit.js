@@ -1,6 +1,12 @@
 const MAX_TRACKED_CLIENTS = 10_000;
 
-export function createOAuthRateLimit({ limit, windowMs, scope }) {
+export function createOAuthRateLimit({
+  limit,
+  windowMs,
+  scope,
+  code = "oauth_rate_limited",
+  message = "Demasiados intentos de acceso. Espera un minuto e intenta nuevamente.",
+}) {
   const clients = new Map();
 
   return function oauthRateLimit(req, res, next) {
@@ -28,8 +34,8 @@ export function createOAuthRateLimit({ limit, windowMs, scope }) {
       res.set("Retry-After", String(retryAfterSeconds));
       return res.status(429).json({
         ok: false,
-        code: "oauth_rate_limited",
-        message: "Demasiados intentos de acceso. Espera un minuto e intenta nuevamente.",
+        code,
+        message,
       });
     }
 

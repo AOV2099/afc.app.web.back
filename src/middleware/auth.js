@@ -2,6 +2,15 @@ import { getRedisClient } from "../redisClient.js";
 import { SESSION_COOKIE_NAME, ROLES, PRIVILEGED_EVENT_CREATOR_ROLES } from "../config/appConfig.js";
 import { sessionKey } from "../utils/session.js";
 
+export function buildRequestAuth(sessionId, session) {
+  return {
+    sessionId,
+    userId: session.userId,
+    role: session.role,
+    careerId: session.careerId ?? null,
+  };
+}
+
 export async function requireAuth(req, res, next) {
   try {
     const redis = getRedisClient();
@@ -24,11 +33,7 @@ export async function requireAuth(req, res, next) {
       return res.status(401).json({ ok: false, message: "Sesión inválida." });
     }
 
-    req.auth = {
-      sessionId,
-      userId: session.userId,
-      role: session.role,
-    };
+    req.auth = buildRequestAuth(sessionId, session);
 
     return next();
   } catch (err) {

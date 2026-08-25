@@ -29,5 +29,33 @@ test("limits repeated OAuth starts by trusted request IP", () => {
   assert.equal(nextCalls, 2);
   assert.equal(third.statusCode, 429);
   assert.equal(third.payload.code, "oauth_rate_limited");
+  assert.equal(
+    third.payload.message,
+    "Demasiados intentos de acceso. Espera un minuto e intenta nuevamente.",
+  );
   assert.equal(third.headers["Retry-After"], "60");
+});
+
+test("supports a custom 429 code and message without changing limit behavior", () => {
+  const middleware = createOAuthRateLimit({
+    limit: 1,
+    windowMs: 60_000,
+    scope: "bulk-preview-test",
+    code: "bulk_student_import_preview_rate_limited",
+    message: "Demasiadas validaciones de archivos CSV.",
+  });
+  const req = { ip: "203.0.113.11" };
+  let nextCalls = 0;
+
+  middleware(req, response(), () => nextCalls++);
+  const rejected = response();
+  middleware(req, rejected, () => nextCalls++);
+
+  assert.equal(nextCalls, 1);
+  assert.equal(rejected.statusCode, 429);
+  assert.deepEqual(rejected.payload, {
+    ok: false,
+    code: "bulk_student_import_preview_rate_limited",
+    message: "Demasiadas validaciones de archivos CSV.",
+  });
 });

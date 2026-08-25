@@ -1,15 +1,139 @@
-import { Router } from "express";
+import express, { Router } from "express";
 import bcrypt from "bcryptjs";
+import crypto from "node:crypto";
 
 import { query, withTransaction } from "../postgresClient.js";
 import { requireAdmin, requireAuth } from "../middleware/auth.js";
+import { createOAuthRateLimit } from "../middleware/oauthRateLimit.js";
 import {
   ALLOWED_MEMBERSHIP_ROLES,
+  BULK_STUDENT_IMPORT_MAX_FILE_BYTES,
   DEFAULT_ORG_ID,
   ROLES,
 } from "../config/appConfig.js";
+import {
+  BulkStudentImportError,
+  commitBulkStudentImport,
+  previewBulkStudentImport,
+} from "../services/bulkStudentImportService.js";
 
 const router = Router();
+const csvTextParser = express.text({
+  type: "text/csv",
+  limit: BULK_STUDENT_IMPORT_MAX_FILE_BYTES,
+});
+const limitStudentImportPreview = createOAuthRateLimit({
+  limit: 10,
+  windowMs: 60_000,
+  scope: "bulk-student-import-preview",
+  code: "bulk_student_import_preview_rate_limited",
+  message: "Demasiadas validaciones de archivos CSV. Espera un minuto e intenta nuevamente.",
+});
+const limitStudentImportCommit = createOAuthRateLimit({
+  limit: 20,
+  windowMs: 60_000,
+  scope: "bulk-student-import-commit",
+  code: "bulk_student_import_commit_rate_limited",
+  message: "Demasiadas importaciones de estudiantes. Espera un minuto e intenta nuevamente.",
+});
+
+function parseStudentCsvBody(req, res, next) {
+  if (!req.is("text/csv")) {
+    return res.status(415).json({
+      ok: false,
+      code: "content_type_not_supported",
+      message: "Content-Type debe ser text/csv.",
+    });
+  }
+
+  return csvTextParser(req, res, (error) => {
+    if (!error) return next();
+    if (error?.type === "entity.too.large") {
+      return res.status(413).json({
+        ok: false,
+        code: "csv_too_large",
+        message: "El archivo CSV excede el límite permitido de 2 MB.",
+      });
+    }
+    return res.status(400).json({
+      ok: false,
+      code: "csv_body_invalid",
+      message: "No se pudo leer el archivo CSV.",
+    });
+  });
+}
+
+export function sendBulkImportError(res, error, operation) {
+  if (error instanceof BulkStudentImportError) {
+    const payload = { ok: false, code: error.code, message: error.message };
+    if (Array.isArray(error.errors) && error.errors.length > 0) {
+      payload.errors = error.errors;
+    }
+    return res.status(error.status).json(payload);
+  }
+
+  console.error(`Error en importación CSV (${operation}):`, error?.code || error?.name || "error");
+  return res.status(500).json({
+    ok: false,
+    code: "bulk_student_import_failed",
+    message: "No se pudo procesar la importación de estudiantes.",
+  });
+}
+
+export function logBulkStudentImportSuccess({ importerUserId, importId, result, logger = console }) {
+  const importIdHash = crypto.createHash("sha256").update(String(importId)).digest("hex");
+  logger.info(JSON.stringify({
+    event: "bulk_student_import_committed",
+    importer_user_id: String(importerUserId),
+    target_career_id: Number(result.career_id),
+    created: Number(result.created),
+    skipped: Number(result.skipped),
+    import_id_hash: importIdHash,
+  }));
+}
+
+router.post(
+  "/api/admin/users/import/preview",
+  requireAuth,
+  requireAdmin,
+  limitStudentImportPreview,
+  parseStudentCsvBody,
+  async (req, res) => {
+    try {
+      const result = await previewBulkStudentImport({
+        csvText: req.body,
+        importer: req.auth,
+        requestedCareerId: req.query?.career_id,
+      });
+      return res.status(200).json(result);
+    } catch (error) {
+      return sendBulkImportError(res, error, "preview");
+    }
+  },
+);
+
+router.post(
+  "/api/admin/users/import/:importId/commit",
+  requireAuth,
+  requireAdmin,
+  limitStudentImportCommit,
+  async (req, res) => {
+    try {
+      const result = await commitBulkStudentImport({
+        importId: String(req.params.importId || ""),
+        importer: req.auth,
+      });
+      logBulkStudentImportSuccess({
+        importerUserId: req.auth.userId,
+        importId: req.params.importId,
+        result,
+      });
+      return res.status(200).json(result);
+    } catch (error) {
+      return sendBulkImportError(res, error, "commit");
+    }
+  },
+);
 
 router.get("/api/admin/users", requireAuth, requireAdmin, async (req, res) => {
   const page = Math.max(1, Number(req.query?.page || 1));

@@ -21,6 +21,10 @@ import {
   parseIsoDateOrNull,
   parsePlainDecimalOrNull,
 } from "../validators/events.js";
+import {
+  assertEventStaffCareer,
+  loadEventManagerCareerId,
+} from "../services/eventStaffCareer.js";
 
 const router = Router();
 const COUNTER_TTL_SECONDS = 60 * 5;
@@ -3194,7 +3198,7 @@ router.post(
   },
 );
 
-async function createEventRecords(tx, eventInput, rawBody, authUserId) {
+async function createEventRecords(tx, eventInput, rawBody, authUserId, managerCareerId) {
   const category = await ensureEventCategoryExists(eventInput.category, tx);
   const eventInsertResult = await tx.query(
     `INSERT INTO events (
@@ -3242,7 +3246,7 @@ async function createEventRecords(tx, eventInput, rawBody, authUserId) {
       throw createHttpError(400, "El usuario staff seleccionado no es válido.");
     }
     const staffResult = await tx.query(
-      `SELECT u.id, u.email
+      `SELECT u.id, u.email, u.career_id
        FROM users u
        JOIN memberships m ON m.user_id = u.id AND m.org_id = $2
        WHERE u.id = $1 AND m.role::text = $3
@@ -3251,16 +3255,17 @@ async function createEventRecords(tx, eventInput, rawBody, authUserId) {
     );
     staffUser = staffResult.rows?.[0] ?? null;
     if (!staffUser) throw createHttpError(400, "El usuario staff seleccionado no existe.");
+    assertEventStaffCareer(managerCareerId, staffUser.career_id);
   } else {
     const staffEmail = generateStaffEmail(eventRow.id);
     const rawPassword = generateStaffPassword();
     const passwordHash = await bcrypt.hash(rawPassword, 12);
     try {
       const staffInsertResult = await tx.query(
-        `INSERT INTO users (email, password_hash, first_name, last_name, status, attributes)
-         VALUES ($1, $2, $3, $4, 'active', $5::jsonb)
-         RETURNING id, email`,
-        [staffEmail, passwordHash, "Staff", `Evento ${eventRow.id}`, JSON.stringify({ event_id: eventRow.id, event_staff: true })],
+        `INSERT INTO users (email, password_hash, first_name, last_name, status, career_id, attributes)
+         VALUES ($1, $2, $3, $4, 'active', $5, $6::jsonb)
+         RETURNING id, email, career_id`,
+        [staffEmail, passwordHash, "Staff", `Evento ${eventRow.id}`, managerCareerId, JSON.stringify({ event_id: eventRow.id, event_staff: true })],
       );
       staffUser = staffInsertResult.rows[0];
       staffPassword = rawPassword;
@@ -3347,10 +3352,17 @@ router.post("/api/admin/events/bulk", requireAuth, requireEventManager, async (r
 
   try {
     const created = await withTransaction(async (tx) => {
+      const managerCareerId = await loadEventManagerCareerId(tx, authUserId);
       const results = [];
       for (let index = 0; index < normalizedItems.length; index += 1) {
         try {
-          results.push(await createEventRecords(tx, normalizedItems[index].input, normalizedItems[index].raw, authUserId));
+          results.push(await createEventRecords(
+            tx,
+            normalizedItems[index].input,
+            normalizedItems[index].raw,
+            authUserId,
+            managerCareerId,
+          ));
         } catch (error) {
           error.bulkIndex = index;
           throw error;
@@ -3371,11 +3383,12 @@ router.post("/api/admin/events/bulk", requireAuth, requireEventManager, async (r
       })),
     });
   } catch (err) {
-    const statusCode = err?.statusCode === 400 || err?.statusCode === 409 ? err.statusCode : 500;
+    const statusCode = [400, 403, 409].includes(err?.statusCode) ? err.statusCode : 500;
     const index = Number.isInteger(err?.bulkIndex) ? err.bulkIndex : null;
     return res.status(statusCode).json({
       ok: false,
       success: false,
+      code: err?.code ?? undefined,
       message: statusCode === 500 ? "No se pudo importar el archivo. No se creó ningún evento." : err.message,
       errors: index === null ? [] : [{ index, line: index + 2, title: items[index]?.title || "Evento sin título", message: err.message }],
     });
@@ -3398,6 +3411,7 @@ router.post("/api/admin/events", requireAuth, requireEventManager, async (req, r
 
   try {
     const created = await withTransaction(async (tx) => {
+      const managerCareerId = await loadEventManagerCareerId(tx, authUserId);
       const category = await ensureEventCategoryExists(eventInput.category, tx);
 
       const eventInsertResult = await tx.query(
@@ -3488,7 +3502,7 @@ router.post("/api/admin/events", requireAuth, requireEventManager, async (req, r
         }
 
         const staffResult = await tx.query(
-          `SELECT u.id, u.email
+          `SELECT u.id, u.email, u.career_id
            FROM users u
            JOIN memberships m
              ON m.user_id = u.id
@@ -3505,6 +3519,7 @@ router.post("/api/admin/events", requireAuth, requireEventManager, async (req, r
           validationError.statusCode = 400;
           throw validationError;
         }
+        assertEventStaffCareer(managerCareerId, staffUser.career_id);
 
         const nextAttributes = {
           ...(eventInput.attributes || {}),
@@ -3532,15 +3547,17 @@ router.post("/api/admin/events", requireAuth, requireEventManager, async (req, r
               first_name,
               last_name,
               status,
+              career_id,
               attributes
             )
-            VALUES ($1, $2, $3, $4, 'active', $5::jsonb)
-            RETURNING id, email`,
+            VALUES ($1, $2, $3, $4, 'active', $5, $6::jsonb)
+            RETURNING id, email, career_id`,
             [
               staffEmail,
               passwordHash,
               "Staff",
               `Evento ${eventRow.id}`,
+              managerCareerId,
               JSON.stringify({ event_id: eventRow.id, event_staff: true }),
             ],
           );
@@ -3641,11 +3658,23 @@ router.post("/api/admin/events", requireAuth, requireEventManager, async (req, r
       sessions: created.sessions,
       geofence: created.geofence,
       staff_user: created.staff_user
-        ? { id: created.staff_user.id, email: created.staff_user.email }
+        ? {
+            id: created.staff_user.id,
+            email: created.staff_user.email,
+            career_id: created.staff_user.career_id,
+          }
         : null,
       staff_password: created.staff_password ?? null,
     });
   } catch (err) {
+    if (err?.statusCode === 403) {
+      return res.status(403).json({
+        ok: false,
+        success: false,
+        code: err.code,
+        message: err.message,
+      });
+    }
     if (err?.statusCode === 400) {
       return res.status(400).json({ ok: false, success: false, message: err.message });
     }
@@ -3876,8 +3905,9 @@ router.put("/api/admin/events/:eventId", requireAuth, requireAdmin, async (req, 
           throw validationError;
         }
 
+        const managerCareerId = await loadEventManagerCareerId(tx, req.auth?.userId);
         const staffResult = await tx.query(
-          `SELECT u.id
+          `SELECT u.id, u.career_id
            FROM users u
            JOIN memberships m
              ON m.user_id = u.id
@@ -3893,6 +3923,7 @@ router.put("/api/admin/events/:eventId", requireAuth, requireAdmin, async (req, 
           validationError.statusCode = 400;
           throw validationError;
         }
+        assertEventStaffCareer(managerCareerId, staffResult.rows[0].career_id);
       }
 
       const category =
@@ -4210,6 +4241,14 @@ router.put("/api/admin/events/:eventId", requireAuth, requireAdmin, async (req, 
       geofence: updated.geofence,
     });
   } catch (err) {
+    if (err?.statusCode === 403) {
+      return res.status(403).json({
+        ok: false,
+        success: false,
+        code: err.code,
+        message: err.message,
+      });
+    }
     if (err?.statusCode === 404) {
       return res.status(404).json({ ok: false, success: false, message: err.message });
     }

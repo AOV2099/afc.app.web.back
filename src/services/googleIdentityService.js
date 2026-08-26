@@ -1,11 +1,7 @@
-import crypto from "crypto";
-import bcrypt from "bcryptjs";
-
 import { withTransaction } from "../postgresClient.js";
 import {
   DEFAULT_ORG_ID,
   GOOGLE_ALLOWED_EMAIL_DOMAIN,
-  ROLES,
 } from "../config/appConfig.js";
 
 export class GoogleIdentityError extends Error {
@@ -55,31 +51,39 @@ function normalizeIdentity(profile) {
   };
 }
 
-export async function authenticateGoogleIdentity(profile) {
+export async function authenticateGoogleIdentity(
+  profile,
+  { withTransactionFn = withTransaction } = {},
+) {
   const identity = normalizeIdentity(profile);
 
   try {
-    const user = await withTransaction(async (tx) => {
+    const user = await withTransactionFn(async (tx) => {
       const existingResult = await tx.query(
         `SELECT
            u.id, u.email, u.first_name, u.last_name, u.student_id, u.career_id,
            u.status, u.oauth_provider, u.oauth_subject,
-           c.name AS career_name, c.faculty AS career_faculty,
-           m.role::text AS role
+           c.name AS career_name, c.faculty AS career_faculty
          FROM users u
          LEFT JOIN careers c ON c.id = u.career_id
-         LEFT JOIN memberships m ON m.user_id = u.id AND m.org_id = $3
          WHERE (u.oauth_provider = 'google' AND u.oauth_subject = $1) OR u.email = $2
          ORDER BY CASE
            WHEN u.oauth_provider = 'google' AND u.oauth_subject = $1 THEN 0 ELSE 1
          END
          LIMIT 1
          FOR UPDATE OF u`,
-        [identity.subject, identity.email, DEFAULT_ORG_ID],
+        [identity.subject, identity.email],
       );
 
-      let currentUser = existingResult.rows?.[0] || null;
-      if (currentUser?.status && currentUser.status !== "active") {
+      const currentUser = existingResult.rows?.[0] || null;
+      if (!currentUser) {
+        throw new GoogleIdentityError(
+          403,
+          "google_user_not_provisioned",
+          "Tu cuenta aún no ha sido registrada. Solicita a un administrador que la dé de alta.",
+        );
+      }
+      if (currentUser.status !== "active") {
         throw new GoogleIdentityError(
           403,
           "user_disabled",
@@ -96,47 +100,29 @@ export async function authenticateGoogleIdentity(profile) {
           "El correo ya está vinculado con otra cuenta de acceso.",
         );
       }
-
-      if (currentUser) {
-        await tx.query(
-          `UPDATE users
-           SET oauth_provider = 'google', oauth_subject = $2,
-               email_verified_at = COALESCE(email_verified_at, now()), updated_at = now()
-           WHERE id = $1`,
-          [currentUser.id, identity.subject],
+      const membershipResult = await tx.query(
+        `SELECT role::text AS role
+         FROM memberships
+         WHERE org_id = $1 AND user_id = $2
+         LIMIT 1
+         FOR SHARE`,
+        [DEFAULT_ORG_ID, currentUser.id],
+      );
+      if (!membershipResult.rows?.[0]?.role) {
+        throw new GoogleIdentityError(
+          403,
+          "google_user_not_authorized",
+          "Tu cuenta no tiene autorización para acceder. Contacta a un administrador.",
         );
-        if (!currentUser.role) {
-          await tx.query(
-            `INSERT INTO memberships (org_id, user_id, role)
-             VALUES ($1, $2, $3::membership_role)
-             ON CONFLICT (org_id, user_id) DO NOTHING`,
-            [DEFAULT_ORG_ID, currentUser.id, ROLES.VISITOR],
-          );
-        }
-      } else {
-        const passwordHash = await bcrypt.hash(crypto.randomBytes(32).toString("hex"), 12);
-        const created = await tx.query(
-          `INSERT INTO users (
-             email, password_hash, first_name, last_name, email_verified_at,
-             oauth_provider, oauth_subject, attributes
-           ) VALUES ($1, $2, $3, $4, now(), 'google', $5, $6::jsonb)
-           RETURNING id`,
-          [
-            identity.email,
-            passwordHash,
-            identity.firstName,
-            identity.lastName,
-            identity.subject,
-            JSON.stringify({ google_picture: identity.picture }),
-          ],
-        );
-        await tx.query(
-          `INSERT INTO memberships (org_id, user_id, role)
-           VALUES ($1, $2, $3::membership_role)`,
-          [DEFAULT_ORG_ID, created.rows[0].id, ROLES.VISITOR],
-        );
-        currentUser = { id: created.rows[0].id };
       }
+
+      await tx.query(
+        `UPDATE users
+         SET oauth_provider = 'google', oauth_subject = $2,
+             email_verified_at = COALESCE(email_verified_at, now()), updated_at = now()
+         WHERE id = $1`,
+        [currentUser.id, identity.subject],
+      );
 
       const authenticated = await tx.query(
         `SELECT

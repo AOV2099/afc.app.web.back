@@ -20,6 +20,8 @@ import alertsRoutes from "./src/routes/alertsRoutes.js";
 
 const app = express();
 const PORT = Number(process.env.PORT || 3000);
+const IS_LOCAL_RUNTIME = process.env.NODE_ENV !== "production";
+const allowAnyCorsOrigin = IS_LOCAL_RUNTIME || CORS_ALLOW_ANY_ORIGIN;
 
 app.set("trust proxy", TRUST_PROXY);
 
@@ -35,7 +37,7 @@ const allowedOrigins = new Set([
 ]);
 const corsOptions = {
   origin(origin, callback) {
-    if (!origin || CORS_ALLOW_ANY_ORIGIN || allowedOrigins.has(origin)) {
+    if (!origin || allowAnyCorsOrigin || allowedOrigins.has(origin)) {
       return callback(null, true);
     }
     return callback(new Error("Origen no permitido por CORS"));
@@ -109,8 +111,14 @@ async function startServer() {
     console.log(
       `Gateway confiable: ${TRUST_PROXY || "desactivado"}; URL pública: ${PUBLIC_URL || "no configurada"}`,
     );
-    if (CORS_ALLOW_ANY_ORIGIN) {
-      console.warn("CORS permite cualquier origen; usa CORS_ALLOW_ANY_ORIGIN=false en producción.");
+    if (IS_LOCAL_RUNTIME) {
+      console.log("Entorno no productivo/local: CORS acepta cualquier origen.");
+    } else if (CORS_ALLOW_ANY_ORIGIN) {
+      console.warn(
+        "Producción: CORS acepta cualquier origen porque CORS_ALLOW_ANY_ORIGIN está activado.",
+      );
+    } else {
+      console.log("Producción: CORS restringido a la lista de orígenes permitidos.");
     }
   });
 }

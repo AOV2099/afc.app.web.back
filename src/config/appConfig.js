@@ -26,6 +26,29 @@ export const HEALTHCHECK_TIMEOUT_MS = Number.isFinite(healthcheckTimeout)
   ? Math.min(10_000, Math.max(500, Math.trunc(healthcheckTimeout)))
   : 5000;
 
+const bulkStudentImportMaxFileBytes = Number(
+  process.env.BULK_STUDENT_IMPORT_MAX_FILE_BYTES || 2 * 1024 * 1024,
+);
+export const BULK_STUDENT_IMPORT_MAX_FILE_BYTES = Number.isFinite(
+  bulkStudentImportMaxFileBytes,
+)
+  ? Math.min(2 * 1024 * 1024, Math.max(1024, Math.trunc(bulkStudentImportMaxFileBytes)))
+  : 2 * 1024 * 1024;
+
+const bulkStudentImportMaxRows = Number(process.env.BULK_STUDENT_IMPORT_MAX_ROWS || 1000);
+export const BULK_STUDENT_IMPORT_MAX_ROWS = Number.isFinite(bulkStudentImportMaxRows)
+  ? Math.min(1000, Math.max(1, Math.trunc(bulkStudentImportMaxRows)))
+  : 1000;
+
+const bulkStudentImportPreviewTtl = Number(
+  process.env.BULK_STUDENT_IMPORT_PREVIEW_TTL_SECONDS || 600,
+);
+export const BULK_STUDENT_IMPORT_PREVIEW_TTL_SECONDS = Number.isFinite(
+  bulkStudentImportPreviewTtl,
+)
+  ? Math.min(600, Math.max(60, Math.trunc(bulkStudentImportPreviewTtl)))
+  : 600;
+
 const trustProxyRaw = String(process.env.TRUST_PROXY || "").trim();
 export const TRUST_PROXY = /^\d+$/.test(trustProxyRaw)
   ? Number(trustProxyRaw)

@@ -1,17 +1,165 @@
-import { Router } from "express";
+import express, { Router } from "express";
 import bcrypt from "bcryptjs";
+import crypto from "node:crypto";
 
 import { query, withTransaction } from "../postgresClient.js";
-import { requireAdmin, requireAuth } from "../middleware/auth.js";
+import { requireAuth, requireCareerAdmin } from "../middleware/auth.js";
+import { createOAuthRateLimit } from "../middleware/oauthRateLimit.js";
 import {
   ALLOWED_MEMBERSHIP_ROLES,
+  BULK_STUDENT_IMPORT_MAX_FILE_BYTES,
   DEFAULT_ORG_ID,
   ROLES,
 } from "../config/appConfig.js";
+import {
+  BulkStudentImportError,
+  commitBulkStudentImport,
+  previewBulkStudentImport,
+} from "../services/bulkStudentImportService.js";
+import {
+  assertRequestedCareerAccess,
+  buildAdminCareerFilter,
+  getScopedAdminCareerId,
+  lockAdminUserTarget,
+  normalizeCareerId,
+  resolveEffectiveCreateCareer,
+} from "../services/adminUserCareerScope.js";
 
 const router = Router();
+const csvTextParser = express.text({
+  type: "text/csv",
+  limit: BULK_STUDENT_IMPORT_MAX_FILE_BYTES,
+});
+const limitStudentImportPreview = createOAuthRateLimit({
+  limit: 10,
+  windowMs: 60_000,
+  scope: "bulk-student-import-preview",
+  code: "bulk_student_import_preview_rate_limited",
+  message: "Demasiadas validaciones de archivos CSV. Espera un minuto e intenta nuevamente.",
+});
+const limitStudentImportCommit = createOAuthRateLimit({
+  limit: 20,
+  windowMs: 60_000,
+  scope: "bulk-student-import-commit",
+  code: "bulk_student_import_commit_rate_limited",
+  message: "Demasiadas importaciones de estudiantes. Espera un minuto e intenta nuevamente.",
+});
 
-router.get("/api/admin/users", requireAuth, requireAdmin, async (req, res) => {
+const CAREER_INPUT_KEYS = ["career_id", "careerId", "carrera_id", "carreraId"];
+
+function readCareerInput(body) {
+  const key = CAREER_INPUT_KEYS.find((candidate) =>
+    Object.prototype.hasOwnProperty.call(body ?? {}, candidate));
+  return key ? { provided: true, value: body[key] } : { provided: false, value: undefined };
+}
+
+function sendScopeError(res, error) {
+  return res.status(error.statusCode).json({
+    ok: false,
+    code: error.code,
+    message: error.message,
+  });
+}
+
+function parseStudentCsvBody(req, res, next) {
+  if (!req.is("text/csv")) {
+    return res.status(415).json({
+      ok: false,
+      code: "content_type_not_supported",
+      message: "Content-Type debe ser text/csv.",
+    });
+  }
+
+  return csvTextParser(req, res, (error) => {
+    if (!error) return next();
+    if (error?.type === "entity.too.large") {
+      return res.status(413).json({
+        ok: false,
+        code: "csv_too_large",
+        message: "El archivo CSV excede el límite permitido de 2 MB.",
+      });
+    }
+    return res.status(400).json({
+      ok: false,
+      code: "csv_body_invalid",
+      message: "No se pudo leer el archivo CSV.",
+    });
+  });
+}
+
+export function sendBulkImportError(res, error, operation) {
+  if (error instanceof BulkStudentImportError) {
+    const payload = { ok: false, code: error.code, message: error.message };
+    if (Array.isArray(error.errors) && error.errors.length > 0) {
+      payload.errors = error.errors;
+    }
+    return res.status(error.status).json(payload);
+  }
+
+  console.error(`Error en importación CSV (${operation}):`, error?.code || error?.name || "error");
+  return res.status(500).json({
+    ok: false,
+    code: "bulk_student_import_failed",
+    message: "No se pudo procesar la importación de estudiantes.",
+  });
+}
+
+export function logBulkStudentImportSuccess({ importerUserId, importId, result, logger = console }) {
+  const importIdHash = crypto.createHash("sha256").update(String(importId)).digest("hex");
+  logger.info(JSON.stringify({
+    event: "bulk_student_import_committed",
+    importer_user_id: String(importerUserId),
+    target_career_id: Number(result.career_id),
+    created: Number(result.created),
+    skipped: Number(result.skipped),
+    import_id_hash: importIdHash,
+  }));
+}
+
+router.post(
+  "/api/admin/users/import/preview",
+  requireAuth,
+  requireCareerAdmin,
+  limitStudentImportPreview,
+  parseStudentCsvBody,
+  async (req, res) => {
+    try {
+      const result = await previewBulkStudentImport({
+        csvText: req.body,
+        importer: req.auth,
+        requestedCareerId: req.query?.career_id,
+      });
+      return res.status(200).json(result);
+    } catch (error) {
+      return sendBulkImportError(res, error, "preview");
+    }
+  },
+);
+
+router.post(
+  "/api/admin/users/import/:importId/commit",
+  requireAuth,
+  requireCareerAdmin,
+  limitStudentImportCommit,
+  async (req, res) => {
+    try {
+      const result = await commitBulkStudentImport({
+        importId: String(req.params.importId || ""),
+        importer: req.auth,
+      });
+      logBulkStudentImportSuccess({
+        importerUserId: req.auth.userId,
+        importId: req.params.importId,
+        result,
+      });
+      return res.status(200).json(result);
+    } catch (error) {
+      return sendBulkImportError(res, error, "commit");
+    }
+  },
+);
+
+router.get("/api/admin/users", requireAuth, requireCareerAdmin, async (req, res) => {
   const page = Math.max(1, Number(req.query?.page || 1));
   const pageSize = Math.min(100, Math.max(1, Number(req.query?.pageSize || 20)));
   const q = String(req.query?.q || "").trim();
@@ -24,6 +172,12 @@ router.get("/api/admin/users", requireAuth, requireAdmin, async (req, res) => {
 
   const filters = [];
   const params = [DEFAULT_ORG_ID];
+
+  const careerScope = buildAdminCareerFilter(req.auth, params.length + 1);
+  if (careerScope.clause) {
+    filters.push(careerScope.clause);
+    params.push(...careerScope.params);
+  }
 
   if (q) {
     const idx = params.length + 1;
@@ -72,10 +226,14 @@ router.get("/api/admin/users", requireAuth, requireAdmin, async (req, res) => {
          u.first_name,
          u.last_name,
          u.student_id,
+         u.career_id,
          u.status,
          u.created_at,
+         c.name AS career_name,
+         c.faculty AS career_faculty,
          m.role::text AS role
        FROM users u
+       LEFT JOIN careers c ON c.id = u.career_id
        LEFT JOIN memberships m
          ON m.user_id = u.id
         AND m.org_id = $1
@@ -105,8 +263,13 @@ router.get("/api/admin/users", requireAuth, requireAdmin, async (req, res) => {
   }
 });
 
-router.get("/api/admin/staff-users", requireAuth, requireAdmin, async (_req, res) => {
+router.get("/api/admin/staff-users", requireAuth, requireCareerAdmin, async (req, res) => {
   try {
+    const params = [DEFAULT_ORG_ID, ROLES.STAFF];
+    const careerScope = buildAdminCareerFilter(req.auth, params.length + 1);
+    const whereSql = careerScope.clause ? `WHERE ${careerScope.clause}` : "";
+    params.push(...careerScope.params);
+
     const result = await query(
       `SELECT
          u.id,
@@ -137,9 +300,10 @@ router.get("/api/admin/staff-users", requireAuth, requireAdmin, async (_req, res
             ELSE NULL
           END
         ) = u.id
+       ${whereSql}
        GROUP BY u.id, u.email
        ORDER BY u.id DESC`,
-      [DEFAULT_ORG_ID, ROLES.STAFF],
+      params,
     );
 
     return res.status(200).json({
@@ -155,23 +319,19 @@ router.get("/api/admin/staff-users", requireAuth, requireAdmin, async (_req, res
   }
 });
 
-router.post("/api/admin/users", requireAuth, requireAdmin, async (req, res) => {
+router.post("/api/admin/users", requireAuth, requireCareerAdmin, async (req, res) => {
   const email = String(req.body?.email || "").trim().toLowerCase();
   const password = String(req.body?.password || "").trim();
   const firstName = String(req.body?.firstName ?? req.body?.nombre ?? "").trim();
   const lastName = String(req.body?.lastName ?? req.body?.apellido ?? "").trim();
   const studentId = req.body?.studentId ? String(req.body.studentId).trim() : null;
-  const careerIdInput =
-    req.body?.career_id ?? req.body?.careerId ?? req.body?.carrera_id ?? req.body?.carreraId;
+  const careerInput = readCareerInput(req.body);
   const status = req.body?.status ? String(req.body.status).trim() : "active";
   const role = String(req.body?.role || ROLES.STUDENT).trim();
   const emailVerifiedInput = req.body?.email_verified ?? req.body?.emailVerified;
   const emailVerifiedAtInput = req.body?.email_verified_at ?? req.body?.emailVerifiedAt;
 
-  const careerId =
-    careerIdInput === undefined || careerIdInput === null || String(careerIdInput).trim() === ""
-      ? null
-      : Number(careerIdInput);
+  let careerId;
 
   if (!email || !password || !firstName || !lastName) {
     return res.status(400).json({
@@ -193,6 +353,12 @@ router.post("/api/admin/users", requireAuth, requireAdmin, async (req, res) => {
 
   if (!ALLOWED_MEMBERSHIP_ROLES.has(role)) {
     return res.status(400).json({ ok: false, message: "Rol inválido." });
+  }
+
+  try {
+    careerId = resolveEffectiveCreateCareer(req.auth, careerInput);
+  } catch (error) {
+    return sendScopeError(res, error);
   }
 
   try {
@@ -303,7 +469,7 @@ router.post("/api/admin/users", requireAuth, requireAdmin, async (req, res) => {
   }
 });
 
-router.put("/api/admin/users/:userId", requireAuth, requireAdmin, async (req, res) => {
+router.put("/api/admin/users/:userId", requireAuth, requireCareerAdmin, async (req, res) => {
   const userId = Number(req.params.userId);
 
   if (!Number.isInteger(userId) || userId <= 0) {
@@ -324,25 +490,23 @@ router.put("/api/admin/users/:userId", requireAuth, requireAdmin, async (req, re
         ? null
         : String(req.body.studentId || "").trim()
       : undefined;
-  const careerIdInput =
-    req.body?.career_id ?? req.body?.careerId ?? req.body?.carrera_id ?? req.body?.carreraId;
+  const careerInput = readCareerInput(req.body);
   const status =
     req.body?.status !== undefined ? String(req.body.status || "").trim() : undefined;
   const role = req.body?.role !== undefined ? String(req.body.role || "").trim() : undefined;
-  const careerId =
-    careerIdInput === undefined
-      ? undefined
-      : careerIdInput === null || String(careerIdInput).trim() === ""
-        ? null
-        : Number(careerIdInput);
+  const careerId = careerInput.provided ? normalizeCareerId(careerInput.value) : undefined;
 
   if (email !== undefined && (!email || !email.includes("@"))) {
     return res.status(400).json({ ok: false, message: "Email inválido." });
   }
-  if (careerId !== undefined && careerId !== null) {
-    if (!Number.isInteger(careerId) || careerId <= 0) {
-      return res.status(400).json({ ok: false, message: "career_id inválido." });
-    }
+  if (
+    careerInput.provided &&
+    careerInput.value !== null &&
+    String(careerInput.value).trim() !== "" &&
+    careerId === null &&
+    getScopedAdminCareerId(req.auth) === null
+  ) {
+    return res.status(400).json({ ok: false, message: "career_id inválido." });
   }
   if (role !== undefined && !ALLOWED_MEMBERSHIP_ROLES.has(role)) {
     return res.status(400).json({
@@ -356,7 +520,7 @@ router.put("/api/admin/users/:userId", requireAuth, requireAdmin, async (req, re
     firstName !== undefined ||
     lastName !== undefined ||
     studentId !== undefined ||
-    careerId !== undefined ||
+    careerInput.provided ||
     status !== undefined;
 
   if (!hasUserUpdate && role === undefined) {
@@ -365,21 +529,19 @@ router.put("/api/admin/users/:userId", requireAuth, requireAdmin, async (req, re
 
   try {
     const finalUser = await withTransaction(async (tx) => {
-      const attributesResult = await tx.query(
-        `SELECT attributes
-         FROM users
-         WHERE id = $1
-         LIMIT 1`,
-        [userId],
-      );
-      const attributes = attributesResult.rows?.[0]?.attributes ?? null;
+      const targetUser = await lockAdminUserTarget(tx, req.auth, userId, {
+        includeAttributes: true,
+      });
+      assertRequestedCareerAccess(req.auth, careerInput);
+
+      const attributes = targetUser.attributes ?? null;
       if (attributes && attributes.event_staff === true) {
         const forbiddenError = new Error("No se puede editar un usuario staff ligado a evento.");
         forbiddenError.statusCode = 403;
         throw forbiddenError;
       }
 
-      if (careerId !== undefined && careerId !== null) {
+      if (careerInput.provided && careerId !== null) {
         const careerExists = await tx.query(
           `SELECT id FROM careers WHERE id = $1 LIMIT 1`,
           [careerId],
@@ -412,7 +574,7 @@ router.put("/api/admin/users/:userId", requireAuth, requireAdmin, async (req, re
           fields.push(`student_id = $${idx++}`);
           values.push(studentId);
         }
-        if (careerId !== undefined) {
+        if (careerInput.provided) {
           fields.push(`career_id = $${idx++}`);
           values.push(careerId);
         }
@@ -424,26 +586,13 @@ router.put("/api/admin/users/:userId", requireAuth, requireAdmin, async (req, re
         fields.push(`updated_at = now()`);
         values.push(userId);
 
-        const updatedUserResult = await tx.query(
+        await tx.query(
           `UPDATE users
            SET ${fields.join(", ")}
            WHERE id = $${idx}
            RETURNING id`,
           values,
         );
-
-        if (updatedUserResult.rowCount === 0) {
-          const notFoundError = new Error("Usuario no encontrado.");
-          notFoundError.statusCode = 404;
-          throw notFoundError;
-        }
-      } else {
-        const exists = await tx.query(`SELECT id FROM users WHERE id = $1 LIMIT 1`, [userId]);
-        if (!exists.rows?.[0]) {
-          const notFoundError = new Error("Usuario no encontrado.");
-          notFoundError.statusCode = 404;
-          throw notFoundError;
-        }
       }
 
       if (role !== undefined) {
@@ -487,12 +636,7 @@ router.put("/api/admin/users/:userId", requireAuth, requireAdmin, async (req, re
       user: finalUser,
     });
   } catch (err) {
-    if (err?.statusCode === 400) {
-      return res.status(400).json({ ok: false, message: err.message });
-    }
-    if (err?.statusCode === 403) {
-      return res.status(403).json({ ok: false, message: err.message });
-    }
+    if (err?.statusCode === 400 || err?.statusCode === 403) return sendScopeError(res, err);
     if (err?.statusCode === 404) {
       return res.status(404).json({ ok: false, message: err.message });
     }
@@ -514,7 +658,7 @@ router.put("/api/admin/users/:userId", requireAuth, requireAdmin, async (req, re
 router.patch(
   "/api/admin/users/:userId/password",
   requireAuth,
-  requireAdmin,
+  requireCareerAdmin,
   async (req, res) => {
     const userId = Number(req.params.userId);
     const nextPassword = String(req.body?.newPassword ?? req.body?.password ?? "").trim();
@@ -531,26 +675,27 @@ router.patch(
     }
 
     try {
-      const passwordHash = await bcrypt.hash(nextPassword, 12);
-
-      const updateResult = await query(
-        `UPDATE users
-         SET password_hash = $1,
-             updated_at = now()
-         WHERE id = $2
-         RETURNING id`,
-        [passwordHash, userId],
-      );
-
-      if (updateResult.rowCount === 0) {
-        return res.status(404).json({ ok: false, message: "Usuario no encontrado." });
-      }
+      await withTransaction(async (tx) => {
+        await lockAdminUserTarget(tx, req.auth, userId);
+        const passwordHash = await bcrypt.hash(nextPassword, 12);
+        await tx.query(
+          `UPDATE users
+           SET password_hash = $1,
+               updated_at = now()
+           WHERE id = $2`,
+          [passwordHash, userId],
+        );
+      });
 
       return res.status(200).json({
         ok: true,
         message: "Contraseña actualizada correctamente.",
       });
     } catch (err) {
+      if (err?.statusCode === 403) return sendScopeError(res, err);
+      if (err?.statusCode === 404) {
+        return res.status(404).json({ ok: false, message: err.message });
+      }
       console.error("Error en PATCH /api/admin/users/:userId/password:", err.message);
       return res.status(500).json({
         ok: false,

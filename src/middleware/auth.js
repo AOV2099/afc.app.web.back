@@ -1,6 +1,21 @@
 import { getRedisClient } from "../redisClient.js";
 import { SESSION_COOKIE_NAME, ROLES, PRIVILEGED_EVENT_CREATOR_ROLES } from "../config/appConfig.js";
 import { sessionKey } from "../utils/session.js";
+import {
+  isGlobalCareerAdmin,
+  normalizeCareerId,
+} from "../services/adminUserCareerScope.js";
+
+export { isGlobalCareerAdmin, normalizeCareerId };
+
+export function buildRequestAuth(sessionId, session) {
+  return {
+    sessionId,
+    userId: session.userId,
+    role: session.role,
+    careerId: session.careerId ?? null,
+  };
+}
 
 export async function requireAuth(req, res, next) {
   try {
@@ -24,11 +39,7 @@ export async function requireAuth(req, res, next) {
       return res.status(401).json({ ok: false, message: "Sesión inválida." });
     }
 
-    req.auth = {
-      sessionId,
-      userId: session.userId,
-      role: session.role,
-    };
+    req.auth = buildRequestAuth(sessionId, session);
 
     return next();
   } catch (err) {
@@ -44,6 +55,27 @@ export function requireAdmin(req, res, next) {
       message: "No autorizado. Se requiere rol admin.",
     });
   }
+  return next();
+}
+
+export function requireCareerAdmin(req, res, next) {
+  if (req.auth?.role !== ROLES.ADMIN) {
+    return res.status(403).json({
+      ok: false,
+      message: "No autorizado. Se requiere rol admin.",
+    });
+  }
+
+  const careerId = normalizeCareerId(req.auth?.careerId);
+  if (careerId === null) {
+    return res.status(403).json({
+      ok: false,
+      code: "career_required",
+      message: "El administrador debe volver a iniciar sesión con una carrera válida asignada.",
+    });
+  }
+
+  req.auth.careerId = careerId;
   return next();
 }
 

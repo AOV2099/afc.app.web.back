@@ -67,13 +67,23 @@ function setSessionCookie(req, res, sessionId) {
   });
 }
 
-async function createAuthenticatedSession(redis, userRow) {
-  const sessionId = crypto.randomUUID();
-  const session = {
+export function buildAuthenticatedSession(userRow) {
+  const rawCareerId = userRow?.career_id;
+  const careerId = rawCareerId === null || rawCareerId === undefined
+    ? null
+    : Number(rawCareerId);
+
+  return {
     userId: userRow.id,
     role: userRow.role,
+    careerId: Number.isInteger(careerId) ? careerId : null,
     createdAt: Date.now(),
   };
+}
+
+export async function createAuthenticatedSession(redis, userRow) {
+  const sessionId = crypto.randomUUID();
+  const session = buildAuthenticatedSession(userRow);
 
   await redis.set(sessionKey(sessionId), JSON.stringify(session), {
     EX: SESSION_TTL_SECONDS,
@@ -98,7 +108,7 @@ function redirectOAuthError(res, publicOrigin, errorCode) {
   return res.redirect(302, loginUrl.toString());
 }
 
-function safeOAuthErrorCode(error) {
+export function safeOAuthErrorCode(error) {
   if (String(error?.response?.data?.error || "") === "redirect_uri_mismatch") {
     return "redirect_uri_mismatch";
   }
@@ -106,6 +116,8 @@ function safeOAuthErrorCode(error) {
     if (error.code === "user_disabled") return "user_disabled";
     if (error.code === "google_email_domain_forbidden") return "domain_forbidden";
     if (error.code === "oauth_account_conflict") return "account_conflict";
+    if (error.code === "google_user_not_provisioned") return "not_provisioned";
+    if (error.code === "google_user_not_authorized") return "not_authorized";
   }
   return "google_error";
 }

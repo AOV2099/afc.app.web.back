@@ -22,6 +22,7 @@ import {
   getScopedAdminCareerId,
   lockAdminUserTarget,
   normalizeCareerId,
+  resolveAdminUserListCareerFilter,
   resolveEffectiveCreateCareer,
 } from "../services/adminUserCareerScope.js";
 
@@ -173,16 +174,22 @@ router.get("/api/admin/users", requireAuth, requireCareerAdmin, async (req, res)
   const filters = [];
   const params = [DEFAULT_ORG_ID];
 
-  const careerScope = buildAdminCareerFilter(req.auth, params.length + 1);
-  if (careerScope.clause) {
-    filters.push(careerScope.clause);
-    params.push(...careerScope.params);
+  try {
+    const careerFilter = resolveAdminUserListCareerFilter(
+      req.auth,
+      req.query?.career_id,
+      params.length + 1,
+    );
+    if (careerFilter.clause) filters.push(careerFilter.clause);
+    params.push(...careerFilter.params);
+  } catch (error) {
+    return sendScopeError(res, error);
   }
 
   if (q) {
     const idx = params.length + 1;
     filters.push(
-      `(u.email ILIKE $${idx} OR u.first_name ILIKE $${idx} OR u.last_name ILIKE $${idx} OR COALESCE(u.student_id, '') ILIKE $${idx})`,
+      `(u.email ILIKE $${idx} OR u.first_name ILIKE $${idx} OR u.last_name ILIKE $${idx} OR COALESCE(u.student_id, '') ILIKE $${idx} OR COALESCE(c.name, '') ILIKE $${idx})`,
     );
     params.push(`%${q}%`);
   }
@@ -209,6 +216,7 @@ router.get("/api/admin/users", requireAuth, requireCareerAdmin, async (req, res)
        LEFT JOIN memberships m
          ON m.user_id = u.id
         AND m.org_id = $1
+       LEFT JOIN careers c ON c.id = u.career_id
        ${whereSql}`,
       params,
     );

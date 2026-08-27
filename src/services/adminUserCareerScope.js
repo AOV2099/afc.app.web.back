@@ -53,6 +53,58 @@ export function buildAdminCareerFilter(auth, parameterIndex, column = "u.career_
   return { clause: `${column} = $${parameterIndex}`, params: [careerId] };
 }
 
+export function resolveAdminUserListCareerFilter(
+  auth,
+  requestedValue,
+  parameterIndex,
+  column = "u.career_id",
+) {
+  const adminCareerId = requireValidAdminCareer(auth);
+  const requestedText =
+    requestedValue === null || requestedValue === undefined
+      ? ""
+      : String(requestedValue).trim().toLowerCase();
+
+  if (requestedText === "" || requestedText === "all") {
+    return adminCareerId === 1
+      ? { clause: "", params: [] }
+      : { clause: `${column} = $${parameterIndex}`, params: [adminCareerId] };
+  }
+
+  if (requestedText === "none") {
+    if (adminCareerId !== 1) {
+      throw new AdminUserCareerScopeError(
+        403,
+        "career_scope_mismatch",
+        "Solo puedes consultar usuarios de tu propia carrera.",
+      );
+    }
+    return { clause: `${column} IS NULL`, params: [] };
+  }
+
+  const requestedCareerId = normalizeCareerId(requestedText);
+  if (requestedCareerId === null) {
+    throw new AdminUserCareerScopeError(
+      400,
+      "invalid_career_id",
+      "career_id inválido. Usa all, none o un entero positivo.",
+    );
+  }
+
+  if (adminCareerId !== 1 && requestedCareerId !== adminCareerId) {
+    throw new AdminUserCareerScopeError(
+      403,
+      "career_scope_mismatch",
+      "Solo puedes consultar usuarios de tu propia carrera.",
+    );
+  }
+
+  return {
+    clause: `${column} = $${parameterIndex}`,
+    params: [adminCareerId === 1 ? requestedCareerId : adminCareerId],
+  };
+}
+
 export function resolveEffectiveCreateCareer(auth, { provided, value }) {
   const adminCareerId = requireValidAdminCareer(auth);
 

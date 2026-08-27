@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { readFile } from "node:fs/promises";
 import test from "node:test";
 
 import adminUsersRouter from "../src/routes/adminUsersRoutes.js";
@@ -14,6 +15,7 @@ import {
   assertTargetCareerAccess,
   buildAdminCareerFilter,
   lockAdminUserTarget,
+  resolveAdminUserListCareerFilter,
   resolveEffectiveCreateCareer,
 } from "../src/services/adminUserCareerScope.js";
 
@@ -82,6 +84,57 @@ test("global list scope adds no career filter while scoped list uses a parameter
     clause: "u.career_id = $2",
     params: [7],
   });
+});
+
+test("global admin user-list filters support all, none, and a specific career", () => {
+  const global = { role: "admin", careerId: 1 };
+  for (const value of [undefined, null, "", "  ", "all", "ALL"]) {
+    assert.deepEqual(resolveAdminUserListCareerFilter(global, value, 2), {
+      clause: "",
+      params: [],
+    });
+  }
+  assert.deepEqual(resolveAdminUserListCareerFilter(global, "none", 2), {
+    clause: "u.career_id IS NULL",
+    params: [],
+  });
+  assert.deepEqual(resolveAdminUserListCareerFilter(global, "12", 2), {
+    clause: "u.career_id = $2",
+    params: [12],
+  });
+});
+
+test("regional admin user-list filters resolve all and own career to one mandatory predicate", () => {
+  const regional = { role: "admin", careerId: 7 };
+  for (const value of [undefined, "", "all", "7", 7]) {
+    assert.deepEqual(resolveAdminUserListCareerFilter(regional, value, 4), {
+      clause: "u.career_id = $4",
+      params: [7],
+    });
+  }
+});
+
+test("regional admin user-list filters deny none and other careers", () => {
+  const regional = { role: "admin", careerId: 7 };
+  for (const value of ["none", "8", 1]) {
+    assert.throws(
+      () => resolveAdminUserListCareerFilter(regional, value, 2),
+      scopeError("career_scope_mismatch"),
+    );
+  }
+});
+
+test("admin user-list filters reject malformed career IDs", () => {
+  const global = { role: "admin", careerId: 1 };
+  for (const value of ["0", "-1", "1.5", "career-2", "2,3"]) {
+    assert.throws(
+      () => resolveAdminUserListCareerFilter(global, value, 2),
+      (error) =>
+        error instanceof AdminUserCareerScopeError &&
+        error.statusCode === 400 &&
+        error.code === "invalid_career_id",
+    );
+  }
 });
 
 test("scoped creation forces an omitted career and rejects explicit null or mismatch", () => {
@@ -177,4 +230,20 @@ test("every admin-user route uses career-aware admin middleware", () => {
     ],
   );
   assert.ok(protectedRoutes.every(({ handlers }) => handlers.includes(requireCareerAdmin)));
+});
+
+test("admin user list route wires career filtering and career-name search into both queries", async () => {
+  const source = await readFile(
+    new URL("../src/routes/adminUsersRoutes.js", import.meta.url),
+    "utf8",
+  );
+  const listRoute = source.slice(
+    source.indexOf('router.get("/api/admin/users"'),
+    source.indexOf('router.get("/api/admin/staff-users"'),
+  );
+
+  assert.match(listRoute, /req\.query\?\.career_id/u);
+  assert.match(listRoute, /resolveAdminUserListCareerFilter/u);
+  assert.match(listRoute, /COALESCE\(c\.name, ''\) ILIKE/u);
+  assert.equal((listRoute.match(/LEFT JOIN careers c ON c\.id = u\.career_id/gu) || []).length, 2);
 });

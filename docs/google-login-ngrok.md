@@ -87,10 +87,13 @@ CORS_ORIGIN=http://ecosistemadigital.aragon.unam.mx:3005,https://reclining-sulfu
 PUBLIC_API_BASE_URL=
 PUBLIC_GOOGLE_CLIENT_ID=<client-id-web>
 PUBLIC_GOOGLE_AUTH_MODE=gateway
+PUBLIC_GOOGLE_AUTH_URL=https://reclining-sulfur-reward.ngrok-free.dev/auth/google
 AFC_BACKEND_URL=http://afc-back:3000
 ```
 
 `PUBLIC_API_BASE_URL` debe quedar vacío para utilizar rutas relativas a través del gateway.
+`PUBLIC_GOOGLE_AUTH_URL` evita que un frontend abierto directamente, por ejemplo Vite local,
+intente resolver `/auth/google` contra su propio origen.
 
 ## Google Cloud
 
@@ -127,8 +130,9 @@ El gateway enruta:
 
 ## Flujo Google
 
-1. El navegador abre la URL HTTPS ngrok.
-2. El botón navega relativamente a `/auth/google`.
+1. El navegador abre el frontend local, directo o mediante la URL HTTPS pública.
+2. El botón navega a `PUBLIC_GOOGLE_AUTH_URL`; si no está configurada, utiliza
+  `${PUBLIC_API_BASE_URL}/auth/google` o la ruta relativa `/auth/google`.
 3. El gateway reenvía la solicitud a AFC Back.
 4. AFC Back genera `state` y PKCE y redirige a Google.
 5. Google retorna a `/auth/google/callback` bajo el mismo dominio HTTPS.

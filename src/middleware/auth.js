@@ -14,6 +14,7 @@ export function buildRequestAuth(sessionId, session) {
     userId: session.userId,
     role: session.role,
     careerId: session.careerId ?? null,
+    picture: typeof session.picture === "string" ? session.picture : null,
   };
 }
 

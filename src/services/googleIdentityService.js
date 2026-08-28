@@ -13,6 +13,26 @@ export class GoogleIdentityError extends Error {
   }
 }
 
+export function normalizeGooglePictureUrl(value) {
+  const picture = String(value || "").trim();
+  if (!picture || picture.length > 2048) return null;
+
+  try {
+    const url = new URL(picture);
+    const hostname = url.hostname.toLowerCase();
+    const isGoogleImageHost =
+      hostname === "googleusercontent.com" || hostname.endsWith(".googleusercontent.com");
+
+    if (url.protocol !== "https:" || url.username || url.password || !isGoogleImageHost) {
+      return null;
+    }
+
+    return url.toString();
+  } catch {
+    return null;
+  }
+}
+
 function normalizeIdentity(profile) {
   const email = String(profile?.email || "").trim().toLowerCase();
   const subject = String(profile?.sub || "").trim();
@@ -47,7 +67,7 @@ function normalizeIdentity(profile) {
     subject,
     firstName,
     lastName,
-    picture: String(profile?.picture || "").trim() || null,
+    picture: normalizeGooglePictureUrl(profile?.picture),
   };
 }
 
@@ -139,7 +159,7 @@ export async function authenticateGoogleIdentity(
     });
 
     if (!user) throw new Error("No se pudo recuperar el usuario autenticado con Google.");
-    return user;
+    return { ...user, picture: identity.picture };
   } catch (error) {
     if (error instanceof GoogleIdentityError) throw error;
     if (error?.code === "23505") {

@@ -4,6 +4,7 @@ import test from "node:test";
 import {
   authenticateGoogleIdentity,
   GoogleIdentityError,
+  normalizeGooglePictureUrl,
 } from "../src/services/googleIdentityService.js";
 import { safeOAuthErrorCode } from "../src/routes/authRoutes.js";
 
@@ -13,11 +14,19 @@ const PROFILE = {
   email_verified: true,
   given_name: "Student",
   family_name: "Example",
+  picture: "https://lh3.googleusercontent.com/a/example=s96-c",
 };
 
 function transactionWith(tx) {
   return async (work) => work(tx);
 }
+
+test("accepts only HTTPS Google-hosted profile pictures", () => {
+  assert.equal(normalizeGooglePictureUrl(PROFILE.picture), PROFILE.picture);
+  assert.equal(normalizeGooglePictureUrl("http://lh3.googleusercontent.com/avatar"), null);
+  assert.equal(normalizeGooglePictureUrl("https://example.com/avatar"), null);
+  assert.equal(normalizeGooglePictureUrl("javascript:alert(1)"), null);
+});
 
 test("maps provisioning failures to sanitized callback query codes", () => {
   assert.equal(
@@ -109,6 +118,7 @@ test("links any active existing authorized user and preserves the membership rol
   });
 
   assert.equal(user.role, "auditor");
+  assert.equal(user.picture, PROFILE.picture);
   assert.equal(statements.some((sql) => /INSERT\s+INTO/iu.test(sql)), false);
   assert.equal(statements.filter((sql) => /^\s*UPDATE\s+users/iu.test(sql)).length, 1);
 });

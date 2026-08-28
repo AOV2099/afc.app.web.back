@@ -27,6 +27,7 @@ import { safeUserPayload, sessionKey } from "../utils/session.js";
 import {
   authenticateGoogleIdentity,
   GoogleIdentityError,
+  normalizeGooglePictureUrl,
 } from "../services/googleIdentityService.js";
 import {
   createGoogleOAuthState,
@@ -77,7 +78,15 @@ export function buildAuthenticatedSession(userRow) {
     userId: userRow.id,
     role: userRow.role,
     careerId: Number.isInteger(careerId) ? careerId : null,
+    picture: normalizeGooglePictureUrl(userRow?.picture),
     createdAt: Date.now(),
+  };
+}
+
+function authenticatedUserPayload(userRow, picture = null) {
+  return {
+    ...safeUserPayload(userRow),
+    picture: normalizeGooglePictureUrl(picture),
   };
 }
 
@@ -194,7 +203,7 @@ router.post("/api/login", async (req, res) => {
     return res.status(200).json({
       ok: true,
       message: "Login correcto.",
-      user: safeUserPayload(userRow),
+      user: authenticatedUserPayload(userRow),
       role: userRow.role,
     });
   } catch (err) {
@@ -254,7 +263,7 @@ router.post("/api/auth/google", limitDirectGoogleLogin, async (req, res) => {
     return res.status(200).json({
       ok: true,
       message: "Login con Google correcto.",
-      user: safeUserPayload(user),
+      user: authenticatedUserPayload(user, user.picture),
       role: user.role,
     });
   } catch (err) {
@@ -462,7 +471,10 @@ router.get("/api/me", requireAuth, async (req, res) => {
     return res.status(401).json({ ok: false, message: "Usuario inválido." });
   }
 
-  return res.status(200).json({ ok: true, user: safeUserPayload(userRow) });
+  return res.status(200).json({
+    ok: true,
+    user: authenticatedUserPayload(userRow, req.auth.picture),
+  });
 });
 
 router.get("/api/careers", async (_req, res) => {
@@ -653,10 +665,13 @@ router.patch("/api/me/profile", requireAuth, async (req, res) => {
     return res.status(200).json({
       ok: true,
       message: "Perfil actualizado correctamente.",
-      user: safeUserPayload({
-        ...updatedUser,
-        role: userRow.role,
-      }),
+      user: authenticatedUserPayload(
+        {
+          ...updatedUser,
+          role: userRow.role,
+        },
+        req.auth.picture,
+      ),
     });
   } catch (err) {
     if (err?.code === "23505") {

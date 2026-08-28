@@ -29,6 +29,7 @@ test("authenticated sessions persist careerId and requireAuth exposes it", async
     userId: "42",
     role: "admin",
     careerId: 9,
+    picture: null,
   });
 });
 
@@ -36,4 +37,24 @@ test("sessions represent an unassigned career as null", () => {
   const session = buildAuthenticatedSession({ id: "43", role: "admin", career_id: null });
   assert.equal(session.careerId, null);
   assert.equal(buildRequestAuth("sid", session).careerId, null);
+});
+
+test("Google pictures remain session-only and are exposed by requireAuth", async () => {
+  const picture = "https://lh3.googleusercontent.com/a/example=s96-c";
+  let savedSession = null;
+  const redis = {
+    async set(_key, value) {
+      savedSession = JSON.parse(value);
+    },
+  };
+
+  await createAuthenticatedSession(redis, {
+    id: "44",
+    role: "student",
+    career_id: "2",
+    picture,
+  });
+
+  assert.equal(savedSession.picture, picture);
+  assert.equal(buildRequestAuth("sid", savedSession).picture, picture);
 });

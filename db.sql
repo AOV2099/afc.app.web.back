@@ -511,6 +511,8 @@ CREATE TABLE IF NOT EXISTS hours_ledger (
 
   created_by            BIGINT REFERENCES users(id) ON DELETE SET NULL,
   note                  TEXT,
+  category              TEXT REFERENCES event_categories(key) ON DELETE SET NULL,
+  request_id            UUID,
   created_at            TIMESTAMPTZ NOT NULL DEFAULT now(),
 
   -- Prevent double-crediting the same check-in
@@ -519,6 +521,14 @@ CREATE TABLE IF NOT EXISTS hours_ledger (
 
 CREATE INDEX IF NOT EXISTS idx_hours_ledger_user ON hours_ledger (user_id, created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_hours_ledger_event ON hours_ledger (event_id);
+
+ALTER TABLE hours_ledger
+  ADD COLUMN IF NOT EXISTS request_id UUID,
+  ADD COLUMN IF NOT EXISTS category TEXT REFERENCES event_categories(key) ON DELETE SET NULL;
+
+CREATE UNIQUE INDEX IF NOT EXISTS uq_hours_ledger_request_id
+  ON hours_ledger (request_id)
+  WHERE request_id IS NOT NULL;
 
 -- ----------
 -- Optional: attendance flags (e.g., NO_SHOW)

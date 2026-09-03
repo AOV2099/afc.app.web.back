@@ -17,11 +17,16 @@ import authRoutes from "./src/routes/authRoutes.js";
 import adminUsersRoutes from "./src/routes/adminUsersRoutes.js";
 import eventsRoutes from "./src/routes/eventsRoutes.js";
 import alertsRoutes from "./src/routes/alertsRoutes.js";
+import {
+  EVENT_TIME_ZONE,
+  startEventFinalizationScheduler,
+} from "./src/services/eventFinalizationScheduler.js";
 
 const app = express();
 const PORT = Number(process.env.PORT || 3000);
 const IS_LOCAL_RUNTIME = process.env.NODE_ENV !== "production";
 const allowAnyCorsOrigin = IS_LOCAL_RUNTIME || CORS_ALLOW_ANY_ORIGIN;
+let eventFinalizationScheduler = null;
 
 app.set("trust proxy", TRUST_PROXY);
 
@@ -81,6 +86,9 @@ async function initializeDbClients() {
 async function shutdown(signal) {
   console.log(`Recibida señal ${signal}. Cerrando servidor...`);
 
+  eventFinalizationScheduler?.stop();
+  eventFinalizationScheduler = null;
+
   try {
     const redisClient = getRedisClient();
     if (redisClient?.isOpen) {
@@ -105,11 +113,15 @@ process.once("SIGTERM", () => shutdown("SIGTERM"));
 
 async function startServer() {
   await initializeDbClients();
+  eventFinalizationScheduler = startEventFinalizationScheduler();
 
   app.listen(PORT, () => {
     console.log(`Servidor Express escuchando en puerto ${PORT}`);
     console.log(
       `Gateway confiable: ${TRUST_PROXY || "desactivado"}; URL pública: ${PUBLIC_URL || "no configurada"}`,
+    );
+    console.log(
+      `Finalización automática activa: eventos publicados pasan a finalizados a las 00:00 (${EVENT_TIME_ZONE}) del día siguiente.`,
     );
     if (IS_LOCAL_RUNTIME) {
       console.log("Entorno no productivo/local: CORS acepta cualquier origen.");

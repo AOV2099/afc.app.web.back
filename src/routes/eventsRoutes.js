@@ -25,6 +25,10 @@ import {
   assertEventStaffCareer,
   loadEventManagerCareerId,
 } from "../services/eventStaffCareer.js";
+import {
+  assertEventCareerAccess,
+  canManageEventCareer,
+} from "../services/eventCareerAccess.js";
 
 const router = Router();
 const COUNTER_TTL_SECONDS = 60 * 5;
@@ -820,7 +824,7 @@ async function getTimelineFromRedis({ eventId, type, from, to, limit }) {
     .filter(Boolean);
 }
 
-function buildEventConditions({ q, status, category, startsFrom, startsTo, forcePublished }) {
+export function buildEventConditions({ q, status, category, startsFrom, startsTo, endsFrom, forcePublished }) {
   const conditions = [];
   const params = [];
 
@@ -862,6 +866,12 @@ function buildEventConditions({ q, status, category, startsFrom, startsTo, force
     params.push(startsTo);
   }
 
+  if (endsFrom) {
+    const idx = params.length + 1;
+    conditions.push(`e.ends_at >= $${idx}`);
+    params.push(endsFrom);
+  }
+
   return { conditions, params };
 }
 
@@ -882,6 +892,7 @@ async function listEvents({
   category,
   startsFrom,
   startsTo,
+  endsFrom,
   forcePublished,
   includeStaff = false,
 }) {
@@ -904,6 +915,7 @@ async function listEvents({
     category,
     startsFrom,
     startsTo,
+    endsFrom,
     forcePublished,
   });
 
@@ -942,10 +954,16 @@ async function listEvents({
   const staffSelectSql = includeStaff
     ? `,
        su.id AS staff_user_id,
-       su.email AS staff_user_email`
+       su.email AS staff_user_email,
+       owner_user.career_id AS owner_career_id,
+       owner_career.name AS owner_career_name`
     : "";
 
-  const staffGroupSql = includeStaff ? ", su.id" : "";
+  const staffGroupSql = includeStaff ? ", su.id, owner_user.id, owner_career.id" : "";
+  const ownerJoinSql = includeStaff
+    ? `LEFT JOIN users owner_user ON owner_user.id = e.created_by
+       LEFT JOIN careers owner_career ON owner_career.id = owner_user.career_id`
+    : "";
 
   const listResult = await query(
     `SELECT
@@ -985,6 +1003,7 @@ async function listEvents({
      LEFT JOIN event_sessions es ON es.event_id = e.id
      LEFT JOIN registrations r ON r.event_id = e.id
      ${staffJoinSql}
+    ${ownerJoinSql}
      ${whereSql}
      GROUP BY e.id, eg.event_id${staffGroupSql}
      ORDER BY e.starts_at DESC
@@ -1022,6 +1041,7 @@ router.get("/api/events", requireAuth, async (req, res) => {
   const category = req.query?.category ? String(req.query.category).trim() : undefined;
   const startsFrom = req.query?.starts_from ? parseIsoDateOrNull(req.query.starts_from) : null;
   const startsTo = req.query?.starts_to ? parseIsoDateOrNull(req.query.starts_to) : null;
+  const endsFrom = req.query?.ends_from ? parseIsoDateOrNull(req.query.ends_from) : null;
 
   if (status && !EVENT_STATUSES.has(status)) {
     return res.status(400).json({ ok: false, message: "status inválido." });
@@ -1033,6 +1053,9 @@ router.get("/api/events", requireAuth, async (req, res) => {
   if (req.query?.starts_to && !startsTo) {
     return res.status(400).json({ ok: false, message: "starts_to inválido." });
   }
+  if (req.query?.ends_from && !endsFrom) {
+    return res.status(400).json({ ok: false, message: "ends_from inválido." });
+  }
 
   try {
     const result = await listEvents({
@@ -1042,6 +1065,7 @@ router.get("/api/events", requireAuth, async (req, res) => {
       category,
       startsFrom,
       startsTo,
+      endsFrom,
       forcePublished: true,
       includeStaff: false,
     });
@@ -1898,6 +1922,7 @@ router.get("/api/me/hours/history", requireAuth, async (req, res) => {
          hl.hours_delta,
          hl.reason::text AS reason,
          hl.note,
+         hl.category AS ledger_category,
          e.id AS event_id,
          e.title,
          e.category,
@@ -1921,6 +1946,7 @@ router.get("/api/me/hours/history", requireAuth, async (req, res) => {
       created_at: row.created_at,
       hours_delta: Number(row.hours_delta),
       reason: row.reason,
+      category: row.ledger_category ?? row.category ?? null,
       note: row.note,
       event:
         row.event_id === null
@@ -1994,7 +2020,10 @@ router.get("/api/admin/events", requireAuth, requireEventManager, async (req, re
     return res.status(200).json({
       ok: true,
       message: "Eventos de administración obtenidos correctamente.",
-      events: result.events,
+      events: result.events.map((event) => ({
+        ...event,
+        can_manage: canManageEventCareer(req.auth.careerId, event.owner_career_id),
+      })),
       pagination: result.pagination,
     });
   } catch (err) {
@@ -2028,9 +2057,13 @@ router.get(
              WHERE r.status::text IN ('approved', 'pending', 'changes_requested', 'cancel_pending')
            )::int AS registrations_count,
            su.id AS staff_user_id,
-           su.email AS staff_user_email
+           su.email AS staff_user_email,
+           owner_user.career_id AS owner_career_id,
+           owner_career.name AS owner_career_name
          FROM events e
          LEFT JOIN registrations r ON r.event_id = e.id
+         LEFT JOIN users owner_user ON owner_user.id = e.created_by
+         LEFT JOIN careers owner_career ON owner_career.id = owner_user.career_id
          LEFT JOIN users su
            ON su.id = (
              CASE
@@ -2042,7 +2075,7 @@ router.get(
            )
          WHERE e.id = $1
            AND e.org_id = $2
-         GROUP BY e.id, su.id
+         GROUP BY e.id, su.id, owner_user.id, owner_career.id
          LIMIT 1`,
         [eventId, DEFAULT_ORG_ID],
       );
@@ -2051,6 +2084,7 @@ router.get(
       if (!eventRow) {
         return res.status(404).json({ ok: false, message: "Evento no encontrado." });
       }
+      assertEventCareerAccess(req.auth.careerId, eventRow.owner_career_id);
 
       const [sessionsResult, geoResult] = await Promise.all([
         query(
@@ -2092,6 +2126,9 @@ router.get(
         staff_user: staffUser,
       });
     } catch (err) {
+      if (err?.statusCode === 403) {
+        return res.status(403).json({ ok: false, code: err.code, message: err.message });
+      }
       console.error("Error en GET /api/admin/events/:eventId:", err.message);
       return res.status(500).json({
         ok: false,
@@ -2115,9 +2152,19 @@ router.get("/api/admin/requests/pending", requireAuth, requireEventManager, asyn
     const params = [DEFAULT_ORG_ID];
     let whereExtra = "";
 
+    if (Number(req.auth.careerId) !== 1) {
+      params.push(req.auth.careerId);
+      whereExtra += ` AND EXISTS (
+        SELECT 1
+        FROM users event_owner
+        WHERE event_owner.id = e.created_by
+          AND event_owner.career_id = $${params.length}
+      )`;
+    }
+
     if (eventId !== null) {
       params.push(eventId);
-      whereExtra = ` AND r.event_id = $${params.length}`;
+      whereExtra += ` AND r.event_id = $${params.length}`;
     }
 
     const countResult = await query(
@@ -2246,9 +2293,11 @@ router.post(
              r.event_id,
              r.user_id,
              r.status::text AS status,
-             r.payload
+             r.payload,
+             owner_user.career_id AS owner_career_id
            FROM registrations r
            JOIN events e ON e.id = r.event_id
+           LEFT JOIN users owner_user ON owner_user.id = e.created_by
            WHERE r.id = $1
              AND e.org_id = $2
            LIMIT 1`,
@@ -2259,6 +2308,7 @@ router.post(
         if (!registration) {
           throw createHttpError(404, "Solicitud no encontrada.");
         }
+        assertEventCareerAccess(req.auth.careerId, registration.owner_career_id);
 
         if (registration.status !== "pending" && registration.status !== "cancel_pending") {
           throw createHttpError(409, "La solicitud ya no está pendiente de aprobación.");
@@ -2539,6 +2589,9 @@ router.post(
         ticket: reviewed.ticket,
       });
     } catch (err) {
+      if (err?.statusCode === 403) {
+        return res.status(403).json({ ok: false, code: err.code, message: err.message });
+      }
       if (err?.statusCode === 404) {
         return res.status(404).json({ ok: false, message: err.message });
       }
@@ -2583,15 +2636,17 @@ router.get(
 
     try {
       const eventResult = await query(
-        `SELECT id
-         FROM events
-         WHERE id = $1 AND org_id = $2
+        `SELECT e.id, owner_user.career_id AS owner_career_id
+         FROM events e
+         LEFT JOIN users owner_user ON owner_user.id = e.created_by
+         WHERE e.id = $1 AND e.org_id = $2
          LIMIT 1`,
         [eventId, DEFAULT_ORG_ID],
       );
       if (!eventResult.rows?.[0]) {
         return res.status(404).json({ ok: false, message: "Evento no encontrado." });
       }
+      assertEventCareerAccess(req.auth.careerId, eventResult.rows[0].owner_career_id);
 
       const timeline = await getTimelineFromRedis({
         eventId,
@@ -2612,6 +2667,9 @@ router.get(
         timeline,
       });
     } catch (err) {
+      if (err?.statusCode === 403) {
+        return res.status(403).json({ ok: false, code: err.code, message: err.message });
+      }
       if (err?.statusCode === 400) {
         return res.status(400).json({ ok: false, message: err.message });
       }
@@ -2649,10 +2707,12 @@ router.get(
 
     try {
       const eventResult = await query(
-        `SELECT id, title, starts_at, ends_at, status, registration_mode, capacity, capacity_enabled,
-          cover_image_url
-         FROM events
-         WHERE id = $1 AND org_id = $2
+        `SELECT e.id, e.title, e.starts_at, e.ends_at, e.status, e.registration_mode,
+          e.capacity, e.capacity_enabled, e.cover_image_url,
+          owner_user.career_id AS owner_career_id
+         FROM events e
+         LEFT JOIN users owner_user ON owner_user.id = e.created_by
+         WHERE e.id = $1 AND e.org_id = $2
          LIMIT 1`,
         [eventId, DEFAULT_ORG_ID],
       );
@@ -2661,6 +2721,7 @@ router.get(
       if (!event) {
         return res.status(404).json({ ok: false, message: "Evento no encontrado." });
       }
+      assertEventCareerAccess(req.auth.careerId, event.owner_career_id);
 
       const registrationStats = await getEventRegistrationStats(eventId);
       const activitySeries = await getEventActivitySeries({
@@ -2718,6 +2779,9 @@ router.get(
         live,
       });
     } catch (err) {
+      if (err?.statusCode === 403) {
+        return res.status(403).json({ ok: false, code: err.code, message: err.message });
+      }
       if (err?.statusCode === 400) {
         return res.status(400).json({ ok: false, message: err.message });
       }
@@ -2804,10 +2868,12 @@ router.post(
         const resolvedEventId = ticketEventId;
 
         const eventResult = await tx.query(
-          `SELECT id, org_id, title, starts_at, ends_at, status::text AS status,
-                  geo_enforced, hours_value, attributes
-           FROM events
-           WHERE id = $1 AND org_id = $2
+          `SELECT e.id, e.org_id, e.title, e.starts_at, e.ends_at, e.status::text AS status,
+                  e.geo_enforced, e.hours_value, e.attributes,
+                  owner_user.career_id AS owner_career_id
+           FROM events e
+           LEFT JOIN users owner_user ON owner_user.id = e.created_by
+           WHERE e.id = $1 AND e.org_id = $2
            LIMIT 1`,
           [resolvedEventId, DEFAULT_ORG_ID],
         );
@@ -2816,6 +2882,7 @@ router.post(
         if (!event) {
           throw createHttpError(404, "Evento no encontrado.");
         }
+        assertEventCareerAccess(req.auth.careerId, event.owner_career_id);
         if (event.status !== "published") {
           throw createHttpError(
             409,
@@ -3718,9 +3785,10 @@ router.put("/api/admin/events/:eventId", requireAuth, requireAdmin, async (req, 
   try {
     const updated = await withTransaction(async (tx) => {
       const existingResult = await tx.query(
-        `SELECT *
-         FROM events
-         WHERE id = $1 AND org_id = $2
+        `SELECT e.*, owner_user.career_id AS owner_career_id
+         FROM events e
+         LEFT JOIN users owner_user ON owner_user.id = e.created_by
+         WHERE e.id = $1 AND e.org_id = $2
          LIMIT 1`,
         [eventId, DEFAULT_ORG_ID],
       );
@@ -3731,6 +3799,7 @@ router.put("/api/admin/events/:eventId", requireAuth, requireAdmin, async (req, 
         notFoundError.statusCode = 404;
         throw notFoundError;
       }
+      assertEventCareerAccess(req.auth.careerId, existingEvent.owner_career_id);
 
       const startsAt =
         updates.starts_at !== undefined
@@ -4286,9 +4355,10 @@ router.delete(
     try {
       const deleted = await withTransaction(async (tx) => {
         const existingResult = await tx.query(
-          `SELECT id, title
-           FROM events
-           WHERE id = $1 AND org_id = $2
+          `SELECT e.id, e.title, owner_user.career_id AS owner_career_id
+           FROM events e
+           LEFT JOIN users owner_user ON owner_user.id = e.created_by
+           WHERE e.id = $1 AND e.org_id = $2
            LIMIT 1`,
           [eventId, DEFAULT_ORG_ID],
         );
@@ -4299,6 +4369,7 @@ router.delete(
           notFoundError.statusCode = 404;
           throw notFoundError;
         }
+        assertEventCareerAccess(req.auth.careerId, existingEvent.owner_career_id);
 
         const deletedHoursResult = await tx.query(
           `DELETE FROM hours_ledger
@@ -4335,6 +4406,9 @@ router.delete(
         deletedHoursCount: deleted.deletedHoursCount,
       });
     } catch (err) {
+      if (err?.statusCode === 403) {
+        return res.status(403).json({ ok: false, code: err.code, message: err.message });
+      }
       if (err?.statusCode === 404) {
         return res.status(404).json({ ok: false, message: err.message });
       }

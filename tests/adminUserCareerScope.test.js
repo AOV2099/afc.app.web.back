@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { readFile } from "node:fs/promises";
 import test from "node:test";
 
-import adminUsersRouter from "../src/routes/adminUsersRoutes.js";
+import adminUsersRouter, { resolveAdminUserOrder } from "../src/routes/adminUsersRoutes.js";
 import {
   buildRequestAuth,
   isGlobalCareerAdmin,
@@ -40,6 +40,28 @@ test("normalizes career IDs and identifies only career 1 as a global admin", () 
   assert.equal(isGlobalCareerAdmin({ role: "admin", careerId: "1" }), true);
   assert.equal(isGlobalCareerAdmin({ role: "admin", careerId: 2 }), false);
   assert.equal(isGlobalCareerAdmin({ role: "staff", careerId: 1 }), false);
+});
+
+test("admin user sorting resolves only allowlisted columns and directions", () => {
+  assert.equal(resolveAdminUserOrder(), "u.id DESC");
+  assert.equal(
+    resolveAdminUserOrder("name", "asc"),
+    "LOWER(CONCAT_WS(' ', u.first_name, u.last_name)) ASC NULLS LAST, u.id DESC",
+  );
+  assert.equal(
+    resolveAdminUserOrder("career", "desc"),
+    "LOWER(COALESCE(c.name, '')) DESC NULLS LAST, u.id DESC",
+  );
+  assert.equal(
+    resolveAdminUserOrder("account", "asc"),
+    "u.student_id ASC NULLS LAST, u.id DESC",
+  );
+  assert.equal(
+    resolveAdminUserOrder("hours", "desc"),
+    "COALESCE(hb.hours_total, 0) DESC NULLS LAST, u.id DESC",
+  );
+  assert.equal(resolveAdminUserOrder("id; DROP TABLE users", "asc"), null);
+  assert.equal(resolveAdminUserOrder("email", "sideways"), null);
 });
 
 test("career admin middleware denies old, null, and invalid career sessions", () => {
@@ -222,6 +244,9 @@ test("every admin-user route uses career-aware admin middleware", () => {
     [
       "POST /api/admin/users/import/preview",
       "POST /api/admin/users/import/:importId/commit",
+      "POST /api/admin/users/account/:accountNumber/hours",
+      "POST /api/admin/users/hours/import/preview",
+      "POST /api/admin/users/hours/import/:importId/commit",
       "GET /api/admin/users",
       "GET /api/admin/staff-users",
       "POST /api/admin/users",
@@ -245,5 +270,7 @@ test("admin user list route wires career filtering and career-name search into b
   assert.match(listRoute, /req\.query\?\.career_id/u);
   assert.match(listRoute, /resolveAdminUserListCareerFilter/u);
   assert.match(listRoute, /COALESCE\(c\.name, ''\) ILIKE/u);
+  assert.match(listRoute, /LEFT JOIN v_user_hours_balance hb ON hb\.user_id = u\.id/u);
+  assert.match(listRoute, /COALESCE\(hb\.hours_total, 0\).*AS hours_total/u);
   assert.equal((listRoute.match(/LEFT JOIN careers c ON c\.id = u\.career_id/gu) || []).length, 2);
 });

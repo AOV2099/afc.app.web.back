@@ -17,6 +17,15 @@ import {
   previewBulkStudentImport,
 } from "../services/bulkStudentImportService.js";
 import {
+  BulkHoursImportError,
+  commitBulkHoursImport,
+  previewBulkHoursImport,
+} from "../services/bulkHoursImportService.js";
+import {
+  addManualAccountHours,
+  ManualHoursAdjustmentError,
+} from "../services/manualHoursAdjustmentService.js";
+import {
   assertRequestedCareerAccess,
   buildAdminCareerFilter,
   getScopedAdminCareerId,
@@ -45,8 +54,52 @@ const limitStudentImportCommit = createOAuthRateLimit({
   code: "bulk_student_import_commit_rate_limited",
   message: "Demasiadas importaciones de estudiantes. Espera un minuto e intenta nuevamente.",
 });
+const limitManualHoursAdjustment = createOAuthRateLimit({
+  limit: 30,
+  windowMs: 60_000,
+  scope: "manual-hours-adjustment",
+  code: "manual_hours_adjustment_rate_limited",
+  message: "Demasiados ajustes de horas. Espera un minuto e intenta nuevamente.",
+});
+const limitHoursImportPreview = createOAuthRateLimit({
+  limit: 10,
+  windowMs: 60_000,
+  scope: "bulk-hours-import-preview",
+  code: "bulk_hours_import_preview_rate_limited",
+  message: "Demasiadas validaciones de horas. Espera un minuto e intenta nuevamente.",
+});
+const limitHoursImportCommit = createOAuthRateLimit({
+  limit: 20,
+  windowMs: 60_000,
+  scope: "bulk-hours-import-commit",
+  code: "bulk_hours_import_commit_rate_limited",
+  message: "Demasiadas cargas de horas. Espera un minuto e intenta nuevamente.",
+});
 
 const CAREER_INPUT_KEYS = ["career_id", "careerId", "carrera_id", "carreraId"];
+const ADMIN_USER_SORT_FIELDS = Object.freeze({
+  name: "LOWER(CONCAT_WS(' ', u.first_name, u.last_name))",
+  email: "LOWER(u.email)",
+  account: "u.student_id",
+  hours: "COALESCE(hb.hours_total, 0)",
+  career: "LOWER(COALESCE(c.name, ''))",
+  status: "u.status",
+  role: "m.role::text",
+});
+
+export function resolveAdminUserOrder(sortBy, sortDirection) {
+  const normalizedSortBy = String(sortBy || "").trim().toLowerCase();
+  const normalizedDirection = String(sortDirection || "").trim().toLowerCase();
+
+  if (!normalizedSortBy) return "u.id DESC";
+  if (!Object.hasOwn(ADMIN_USER_SORT_FIELDS, normalizedSortBy)) return null;
+  if (normalizedDirection && normalizedDirection !== "asc" && normalizedDirection !== "desc") {
+    return null;
+  }
+
+  const direction = normalizedDirection === "desc" ? "DESC" : "ASC";
+  return `${ADMIN_USER_SORT_FIELDS[normalizedSortBy]} ${direction} NULLS LAST, u.id DESC`;
+}
 
 function readCareerInput(body) {
   const key = CAREER_INPUT_KEYS.find((candidate) =>
@@ -105,6 +158,21 @@ export function sendBulkImportError(res, error, operation) {
   });
 }
 
+function sendBulkHoursImportError(res, error, operation) {
+  if (error instanceof BulkHoursImportError) {
+    const payload = { ok: false, code: error.code, message: error.message };
+    if (Array.isArray(error.errors) && error.errors.length > 0) payload.errors = error.errors;
+    return res.status(error.status).json(payload);
+  }
+
+  console.error(`Error en carga masiva de horas (${operation}):`, error?.code || error?.name || "error");
+  return res.status(500).json({
+    ok: false,
+    code: "bulk_hours_import_failed",
+    message: "No se pudo procesar la carga de horas.",
+  });
+}
+
 export function logBulkStudentImportSuccess({ importerUserId, importId, result, logger = console }) {
   const importIdHash = crypto.createHash("sha256").update(String(importId)).digest("hex");
   logger.info(JSON.stringify({
@@ -160,15 +228,105 @@ router.post(
   },
 );
 
+router.post(
+  "/api/admin/users/account/:accountNumber/hours",
+  requireAuth,
+  requireCareerAdmin,
+  limitManualHoursAdjustment,
+  async (req, res) => {
+    try {
+      const result = await addManualAccountHours({
+        accountNumber: req.params.accountNumber,
+        hours: req.body?.hours,
+        category: req.body?.category,
+        motive: req.body?.motive,
+        requestId: req.body?.requestId,
+        admin: req.auth,
+      });
+
+      return res.status(result.created ? 201 : 200).json({
+        ok: true,
+        message: result.created
+          ? "Horas agregadas correctamente."
+          : "El ajuste ya había sido registrado.",
+        adjustment: result,
+      });
+    } catch (error) {
+      if (error instanceof ManualHoursAdjustmentError) {
+        return res.status(error.statusCode).json({
+          ok: false,
+          code: error.code,
+          message: error.message,
+        });
+      }
+      if (error?.statusCode === 403 || error?.statusCode === 404) {
+        return sendScopeError(res, error);
+      }
+
+      console.error(
+        "Error en POST /api/admin/users/account/:accountNumber/hours:",
+        error?.code || error?.name || "manual_hours_adjustment_failed",
+      );
+      return res.status(500).json({
+        ok: false,
+        code: "manual_hours_adjustment_failed",
+        message: "No se pudieron agregar las horas.",
+      });
+    }
+  },
+);
+
+router.post(
+  "/api/admin/users/hours/import/preview",
+  requireAuth,
+  requireCareerAdmin,
+  limitHoursImportPreview,
+  parseStudentCsvBody,
+  async (req, res) => {
+    try {
+      const result = await previewBulkHoursImport({
+        csvText: req.body,
+        category: req.query?.category,
+        importer: req.auth,
+      });
+      return res.status(200).json(result);
+    } catch (error) {
+      return sendBulkHoursImportError(res, error, "preview");
+    }
+  },
+);
+
+router.post(
+  "/api/admin/users/hours/import/:importId/commit",
+  requireAuth,
+  requireCareerAdmin,
+  limitHoursImportCommit,
+  async (req, res) => {
+    try {
+      const result = await commitBulkHoursImport({
+        importId: String(req.params.importId || ""),
+        importer: req.auth,
+      });
+      return res.status(200).json(result);
+    } catch (error) {
+      return sendBulkHoursImportError(res, error, "commit");
+    }
+  },
+);
+
 router.get("/api/admin/users", requireAuth, requireCareerAdmin, async (req, res) => {
   const page = Math.max(1, Number(req.query?.page || 1));
   const pageSize = Math.min(100, Math.max(1, Number(req.query?.pageSize || 20)));
   const q = String(req.query?.q || "").trim();
   const status = req.query?.status ? String(req.query.status).trim() : undefined;
   const role = req.query?.role ? String(req.query.role).trim() : undefined;
+  const orderBy = resolveAdminUserOrder(req.query?.sortBy, req.query?.sortDirection);
 
   if (role !== undefined && !ALLOWED_MEMBERSHIP_ROLES.has(role)) {
     return res.status(400).json({ ok: false, message: "Rol inválido." });
+  }
+  if (!orderBy) {
+    return res.status(400).json({ ok: false, message: "Ordenamiento inválido." });
   }
 
   const filters = [];
@@ -237,6 +395,7 @@ router.get("/api/admin/users", requireAuth, requireCareerAdmin, async (req, res)
          u.career_id,
          u.status,
          u.created_at,
+         COALESCE(hb.hours_total, 0)::numeric(10,2) AS hours_total,
          c.name AS career_name,
          c.faculty AS career_faculty,
          m.role::text AS role
@@ -245,8 +404,9 @@ router.get("/api/admin/users", requireAuth, requireCareerAdmin, async (req, res)
        LEFT JOIN memberships m
          ON m.user_id = u.id
         AND m.org_id = $1
+       LEFT JOIN v_user_hours_balance hb ON hb.user_id = u.id
        ${whereSql}
-       ORDER BY u.id DESC
+       ORDER BY ${orderBy}
        LIMIT $${limitIdx}
        OFFSET $${offsetIdx}`,
       listParams,

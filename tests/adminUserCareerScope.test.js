@@ -11,6 +11,7 @@ import {
 } from "../src/middleware/auth.js";
 import {
   AdminUserCareerScopeError,
+  assertAdminRoleAssignmentAccess,
   assertRequestedCareerAccess,
   assertTargetCareerAccess,
   buildAdminCareerFilter,
@@ -40,6 +41,23 @@ test("normalizes career IDs and identifies only career 1 as a global admin", () 
   assert.equal(isGlobalCareerAdmin({ role: "admin", careerId: "1" }), true);
   assert.equal(isGlobalCareerAdmin({ role: "admin", careerId: 2 }), false);
   assert.equal(isGlobalCareerAdmin({ role: "staff", careerId: 1 }), false);
+});
+
+test("only the global admin can assign admin or auditor roles", () => {
+  const globalAdmin = { role: "admin", careerId: 1 };
+  const regionalAdmin = { role: "admin", careerId: 7 };
+
+  for (const role of ["admin", "auditor"]) {
+    assert.doesNotThrow(() => assertAdminRoleAssignmentAccess(globalAdmin, role));
+    assert.throws(
+      () => assertAdminRoleAssignmentAccess(regionalAdmin, role),
+      scopeError("privileged_role_required"),
+    );
+  }
+
+  for (const role of ["student", "staff", "visitor", undefined]) {
+    assert.doesNotThrow(() => assertAdminRoleAssignmentAccess(regionalAdmin, role));
+  }
 });
 
 test("admin user sorting resolves only allowlisted columns and directions", () => {
@@ -273,4 +291,12 @@ test("admin user list route wires career filtering and career-name search into b
   assert.match(listRoute, /LEFT JOIN v_user_hours_balance hb ON hb\.user_id = u\.id/u);
   assert.match(listRoute, /COALESCE\(hb\.hours_total, 0\).*AS hours_total/u);
   assert.equal((listRoute.match(/LEFT JOIN careers c ON c\.id = u\.career_id/gu) || []).length, 2);
+});
+
+test("admin user create and update routes enforce privileged role assignment", async () => {
+  const source = await readFile(
+    new URL("../src/routes/adminUsersRoutes.js", import.meta.url),
+    "utf8",
+  );
+  assert.equal((source.match(/assertAdminRoleAssignmentAccess\(req\.auth, role\)/gu) || []).length, 2);
 });

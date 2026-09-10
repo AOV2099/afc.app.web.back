@@ -26,6 +26,7 @@ import {
   ManualHoursAdjustmentError,
 } from "../services/manualHoursAdjustmentService.js";
 import {
+  assertAdminRoleAssignmentAccess,
   assertRequestedCareerAccess,
   buildAdminCareerFilter,
   getScopedAdminCareerId,
@@ -524,6 +525,7 @@ router.post("/api/admin/users", requireAuth, requireCareerAdmin, async (req, res
   }
 
   try {
+    assertAdminRoleAssignmentAccess(req.auth, role);
     careerId = resolveEffectiveCreateCareer(req.auth, careerInput);
   } catch (error) {
     return sendScopeError(res, error);
@@ -696,6 +698,7 @@ router.put("/api/admin/users/:userId", requireAuth, requireCareerAdmin, async (r
   }
 
   try {
+    assertAdminRoleAssignmentAccess(req.auth, role);
     const finalUser = await withTransaction(async (tx) => {
       const targetUser = await lockAdminUserTarget(tx, req.auth, userId, {
         includeAttributes: true,

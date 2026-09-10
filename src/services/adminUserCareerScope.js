@@ -21,6 +21,18 @@ export function isGlobalCareerAdmin(auth) {
   return auth?.role === ROLES.ADMIN && normalizeCareerId(auth?.careerId) === 1;
 }
 
+export function assertAdminRoleAssignmentAccess(auth, roleValue) {
+  const role = String(roleValue || "").trim().toLowerCase();
+  if (role !== ROLES.ADMIN && role !== ROLES.AUDITOR) return;
+  if (isGlobalCareerAdmin(auth)) return;
+
+  throw new AdminUserCareerScopeError(
+    403,
+    "privileged_role_required",
+    "Solo el administrador global puede asignar los roles admin o auditor.",
+  );
+}
+
 export function getScopedAdminCareerId(auth) {
   if (auth?.role !== ROLES.ADMIN) return null;
   const careerId = normalizeCareerId(auth?.careerId);

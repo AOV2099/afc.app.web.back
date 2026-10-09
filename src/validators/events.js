@@ -4,6 +4,10 @@ import {
   REGISTRATION_MODES,
   RESUBMISSION_POLICIES,
 } from "../config/appConfig.js";
+import {
+  HOURS_PENDING_ALLOWED_STATUSES,
+  normalizeAfcValuationInput,
+} from "../services/eventHoursValuation.js";
 
 export const MAX_EVENT_HOURS = 100;
 
@@ -57,8 +61,20 @@ export function normalizeCreateEventPayload(body) {
   const startsAt = parseIsoDateOrNull(body?.starts_at);
   const endsAt = parseIsoDateOrNull(body?.ends_at);
 
-  const hoursValue =
-    body?.hours_value === undefined ? 0 : parsePlainDecimalOrNull(body.hours_value);
+  let afc = null;
+  if (body?.afc_valuation !== undefined && body?.afc_valuation !== null) {
+    const normalizedAfc = normalizeAfcValuationInput(body.afc_valuation);
+    if (normalizedAfc.error) return { error: normalizedAfc.error };
+    afc = normalizedAfc.value;
+  }
+
+  // Con valoración AFC las horas se calculan con el catálogo de la BD en la ruta (prepareEventHoursValuation);
+  // se ignora hours_value del cliente.
+  const hoursValue = afc
+    ? null
+    : body?.hours_value === undefined
+      ? 0
+      : parsePlainDecimalOrNull(body.hours_value);
   const capacityEnabledRaw = body?.capacity_enabled ?? body?.capacityEnabled ?? false;
   const capacityEnabled = parseBooleanInput(capacityEnabledRaw, false);
   const capacityRaw = body?.capacity;
@@ -75,7 +91,10 @@ export function normalizeCreateEventPayload(body) {
       ? "only_changes_requested"
       : String(body.resubmission_policy).trim();
   const allowSelfCheckin = parseBooleanInput(body?.allow_self_checkin, false);
-  const geoEnforced = parseBooleanInput(body?.geo_enforced, false);
+  // Geocerca desactivada temporalmente: con la ubicación activa en el dispositivo el staff no podía
+  // registrar check-ins. Para reactivarla, restaurar:
+  // const geoEnforced = parseBooleanInput(body?.geo_enforced, false);
+  const geoEnforced = false;
   const cancelPolicy =
     body?.cancel_policy === undefined ? "free_cancel" : String(body.cancel_policy).trim();
   const cancelDeadline =
@@ -91,7 +110,7 @@ export function normalizeCreateEventPayload(body) {
   if (startsAt < now) return { error: "La fecha y hora de inicio no pueden estar en el pasado." };
   if (endsAt < now) return { error: "La fecha y hora de fin no pueden estar en el pasado." };
   if (endsAt <= startsAt) return { error: "La fecha y hora de fin deben ser posteriores al inicio." };
-  if (hoursValue === null || hoursValue < 0 || hoursValue > MAX_EVENT_HOURS) {
+  if (!afc && (hoursValue === null || hoursValue < 0 || hoursValue > MAX_EVENT_HOURS)) {
     return {
       error: `Las horas acreditables deben ser un decimal entre 0 y ${MAX_EVENT_HOURS}, sin letras ni notación científica.`,
     };
@@ -105,6 +124,12 @@ export function normalizeCreateEventPayload(body) {
   }
   if (!category) return { error: "La categoría es obligatoria." };
   if (!EVENT_STATUSES.has(status)) return { error: "El estatus seleccionado no es válido." };
+  if (!afc && hoursValue === null && !HOURS_PENDING_ALLOWED_STATUSES.has(status)) {
+    return {
+      error:
+        "Las horas AFC están pendientes de valoración o validación; guarda el evento como borrador hasta contar con horas aprobadas.",
+    };
+  }
   if (!REGISTRATION_MODES.has(registrationMode)) return { error: "El modo de registro seleccionado no es válido." };
   if (!RESUBMISSION_POLICIES.has(resubmissionPolicy)) {
     return { error: "La política de reenvío seleccionada no es válida." };
@@ -207,6 +232,7 @@ export function normalizeCreateEventPayload(body) {
         return { error: `La sesión ${i + 1} debe estar dentro de las fechas del evento.` };
       }
       if (
+        !afc &&
         hasSessionHoursValue &&
         (sessionHoursValue === null || sessionHoursValue < 0 || sessionHoursValue > MAX_EVENT_HOURS)
       ) {
@@ -217,7 +243,8 @@ export function normalizeCreateEventPayload(body) {
         starts_at: sessionStartsAt,
         ends_at: sessionEndsAt,
         label: sessionLabel,
-        hours_value: sessionHoursValue,
+        // Con valoración AFC la sesión usa las horas vigentes del evento.
+        hours_value: afc ? null : sessionHoursValue,
       });
     }
   }
@@ -256,6 +283,8 @@ export function normalizeCreateEventPayload(body) {
       attributes: normalizedAttributes,
       geo,
       sessions,
+      afc,
+      afc_valuation: afc ? afc.valuation : null,
     },
   };
 }

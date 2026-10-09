@@ -52,6 +52,36 @@ const limitGoogleStart = createOAuthRateLimit({
   windowMs: 60_000,
   scope: "google-start",
 });
+const limitPasswordLogin = createOAuthRateLimit({
+  limit: 10,
+  windowMs: 60_000,
+  scope: "password-login",
+  code: "login_rate_limited",
+  message: "Demasiados intentos de inicio de sesión. Espera un minuto e intenta nuevamente.",
+});
+const limitRegister = createOAuthRateLimit({
+  limit: 5,
+  windowMs: 60_000,
+  scope: "register",
+  code: "register_rate_limited",
+  message: "Demasiados registros desde esta conexión. Espera un minuto e intenta nuevamente.",
+});
+
+const EMAIL_PATTERN = /^[^\s@]{1,64}@[^\s@]{1,190}\.[^\s@]{2,}$/u;
+const MAX_PASSWORD_LENGTH = 72;
+const MAX_NAME_LENGTH = 100;
+const ADMIN_CAREER_ID = 1;
+// Hash válido de una contraseña aleatoria: iguala el tiempo de respuesta cuando el usuario no existe.
+const DUMMY_PASSWORD_HASH = bcrypt.hashSync(crypto.randomUUID(), 12);
+
+function requestString(value) {
+  return typeof value === "string" || typeof value === "number" ? String(value) : "";
+}
+
+function parseStrictBoolean(value) {
+  if (typeof value === "boolean") return value;
+  return ["true", "1", "yes", "on"].includes(String(value ?? "").trim().toLowerCase());
+}
 
 function shouldUseSecureCookie(req) {
   return COOKIE_SECURE || Boolean(req.secure);
@@ -131,19 +161,22 @@ export function safeOAuthErrorCode(error) {
   return "google_error";
 }
 
-router.post("/api/login", async (req, res) => {
+router.post("/api/login", limitPasswordLogin, async (req, res) => {
   const emailRaw = req.body?.email ?? req.body?.correo;
   const passwordRaw =
     req.body?.password ?? req.body?.contrasena ?? req.body?.contraseña;
 
-  const email = String(emailRaw || "").trim().toLowerCase();
-  const password = String(passwordRaw || "").trim();
+  const email = requestString(emailRaw).trim().toLowerCase();
+  const password = requestString(passwordRaw).trim();
 
   if (!email || !password) {
     return res.status(400).json({
       ok: false,
       message: "Faltan datos requeridos: email/correo y password.",
     });
+  }
+  if (email.length > 254 || password.length > MAX_PASSWORD_LENGTH) {
+    return res.status(401).json({ ok: false, message: "Credenciales inválidas." });
   }
 
   try {
@@ -177,11 +210,10 @@ router.post("/api/login", async (req, res) => {
     );
 
     const userRow = result.rows?.[0];
-    if (!userRow) {
-      return res.status(401).json({
-        ok: false,
-        message: "Credenciales inválidas o usuario sin rol asignado.",
-      });
+    // Misma respuesta y mismo costo de bcrypt exista o no la cuenta (evita enumerar correos).
+    const passwordOk = await bcrypt.compare(password, userRow?.password_hash || DUMMY_PASSWORD_HASH);
+    if (!userRow || !passwordOk) {
+      return res.status(401).json({ ok: false, message: "Credenciales inválidas." });
     }
 
     if (userRow.status !== "active") {
@@ -190,11 +222,6 @@ router.post("/api/login", async (req, res) => {
         message:
           "El usuario se encuentra deshabilitado. Por favor consulta a un administrador.",
       });
-    }
-
-    const passwordOk = await bcrypt.compare(password, userRow.password_hash);
-    if (!passwordOk) {
-      return res.status(401).json({ ok: false, message: "Credenciales inválidas." });
     }
 
     const sessionId = await createAuthenticatedSession(redis, userRow);
@@ -480,7 +507,7 @@ router.get("/api/me", requireAuth, async (req, res) => {
 router.get("/api/careers", async (_req, res) => {
   try {
     const result = await query(
-      `SELECT id, name, faculty
+      `SELECT id, name, faculty, clave_carrera, afc_hours::float AS afc_hours
        FROM careers
        ORDER BY name ASC`,
     );
@@ -600,7 +627,7 @@ router.patch("/api/me/profile", requireAuth, async (req, res) => {
         }
 
         const nextCareerId = Number(careerIdInput);
-        if (!Number.isInteger(nextCareerId) || nextCareerId <= 0) {
+        if (!Number.isInteger(nextCareerId) || nextCareerId <= 0 || nextCareerId === ADMIN_CAREER_ID) {
           return res.status(400).json({
             ok: false,
             message: "career_id/careerId inválido.",
@@ -645,6 +672,19 @@ router.patch("/api/me/profile", requireAuth, async (req, res) => {
     );
 
     const updatedUserBase = updateResult.rows?.[0] || null;
+
+    // La sesión se revalida contra la carrera actual; se actualiza para no cerrar la sesión propia.
+    if (careerIdInput !== undefined && updatedUserBase) {
+      const redis = getRedisClient();
+      const rawSession = redis ? await redis.get(sessionKey(req.auth.sessionId)) : null;
+      if (rawSession) {
+        await redis.set(
+          sessionKey(req.auth.sessionId),
+          JSON.stringify({ ...JSON.parse(rawSession), careerId: Number(updatedUserBase.career_id) }),
+          { KEEPTTL: true },
+        );
+      }
+    }
 
     const updatedCareerResult = await query(
       `SELECT name, faculty
@@ -793,7 +833,7 @@ router.post("/api/logout", requireAuth, async (req, res) => {
   return res.status(200).json({ ok: true, message: "Sesión cerrada." });
 });
 
-router.post("/api/register", async (req, res) => {
+router.post("/api/register", limitRegister, async (req, res) => {
   const emailRaw = req.body?.email ?? req.body?.correo;
   const firstNameRaw = req.body?.firstName ?? req.body?.nombre;
   const lastNameRaw = req.body?.lastName ?? req.body?.apellido;
@@ -804,16 +844,16 @@ router.post("/api/register", async (req, res) => {
   const passwordRaw =
     req.body?.password ?? req.body?.contrasena ?? req.body?.contraseña;
 
-  const email = String(emailRaw || "").trim().toLowerCase();
-  const firstName = String(firstNameRaw || "").trim();
-  const lastName = String(lastNameRaw || "").trim();
-  const studentId = studentIdRaw === undefined ? null : String(studentIdRaw || "").trim() || null;
+  const email = requestString(emailRaw).trim().toLowerCase();
+  const firstName = requestString(firstNameRaw).trim();
+  const lastName = requestString(lastNameRaw).trim();
+  const studentId = studentIdRaw === undefined ? null : requestString(studentIdRaw).trim() || null;
   const careerId =
     careerIdRaw === undefined || careerIdRaw === null || String(careerIdRaw).trim() === ""
       ? null
       : Number(careerIdRaw);
-  const isStudent = Boolean(isStudentRaw);
-  const password = String(passwordRaw || "").trim();
+  const isStudent = parseStrictBoolean(isStudentRaw);
+  const password = requestString(passwordRaw).trim();
 
   if (!email || !firstName || !lastName || !password) {
     return res.status(400).json({
@@ -823,10 +863,26 @@ router.post("/api/register", async (req, res) => {
     });
   }
 
-  if (password.length < 8) {
+  if (email.length > 254 || !EMAIL_PATTERN.test(email)) {
+    return res.status(400).json({ ok: false, message: "El correo electrónico no es válido." });
+  }
+  if (firstName.length > MAX_NAME_LENGTH || lastName.length > MAX_NAME_LENGTH) {
     return res.status(400).json({
       ok: false,
-      message: "La contraseña debe tener al menos 8 caracteres.",
+      message: `El nombre y el apellido admiten como máximo ${MAX_NAME_LENGTH} caracteres.`,
+    });
+  }
+  if (studentId !== null && !/^\d{8,10}$/u.test(studentId)) {
+    return res.status(400).json({ ok: false, message: "La matrícula debe contener entre 8 y 10 dígitos." });
+  }
+  if (careerId === ADMIN_CAREER_ID) {
+    return res.status(400).json({ ok: false, message: "La carrera indicada no es válida." });
+  }
+
+  if (password.length < 8 || password.length > MAX_PASSWORD_LENGTH) {
+    return res.status(400).json({
+      ok: false,
+      message: `La contraseña debe tener entre 8 y ${MAX_PASSWORD_LENGTH} caracteres.`,
     });
   }
 
@@ -862,13 +918,17 @@ router.post("/api/register", async (req, res) => {
           message: "career_id/careerId inválido.",
         });
       }
+      const careerExists = await query(`SELECT id FROM careers WHERE id = $1 LIMIT 1`, [careerId]);
+      if (!careerExists.rows?.[0]) {
+        return res.status(400).json({ ok: false, message: "La carrera indicada no existe." });
+      }
     }
 
     const role = isStudent ? ROLES.STUDENT : ROLES.VISITOR;
+    // Se calcula fuera de la transacción para no retener una conexión mientras corre bcrypt.
+    const passwordHash = await bcrypt.hash(password, 12);
 
     const createdUser = await withTransaction(async (tx) => {
-      const passwordHash = await bcrypt.hash(password, 12);
-
       const userResult = await tx.query(
         `INSERT INTO users (email, password_hash, first_name, last_name, student_id, career_id)
          VALUES ($1, $2, $3, $4, $5, $6)

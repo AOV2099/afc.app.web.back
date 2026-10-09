@@ -7,3 +7,4 @@ Dockerfile
 .env
 .env.*
 *.log
+storage

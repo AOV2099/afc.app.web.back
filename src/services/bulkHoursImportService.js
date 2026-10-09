@@ -16,6 +16,7 @@ import {
   normalizeAdjustmentMotive,
   normalizeManualHours,
 } from "./manualHoursAdjustmentService.js";
+import { capHoursToGoal, goalCapNote, loadUsersHoursProgress } from "./afcHoursGoal.js";
 
 export const HOURS_CSV_HEADERS = Object.freeze(["numero_cuenta", "horas", "motivo"]);
 
@@ -310,10 +311,17 @@ export async function previewBulkHoursImport({ csvText, category, importer, depe
 
   const tokenRows = validated.rows.map((row) => ({ ...row, requestId: randomUuidFn() }));
   const importId = randomBytesFn(32).toString("base64url");
+  const progress = await loadUsersHoursProgress({ query: queryFn }, tokenRows.map((row) => row.userId));
+  const creditedRows = tokenRows.map((row) => {
+    const { goal, total } = progress.get(String(row.userId));
+    return capHoursToGoal(row.hours, total, goal);
+  });
   const summary = {
     rows: tokenRows.length,
     users: new Set(tokenRows.map((row) => row.userId)).size,
     total_hours: tokenRows.reduce((sum, row) => sum + row.hours, 0),
+    credited_hours: Math.round(creditedRows.reduce((sum, hours) => sum + hours, 0) * 100) / 100,
+    capped_rows: creditedRows.filter((hours, index) => hours < tokenRows[index].hours).length,
   };
   const token = {
     version: 1,
@@ -417,10 +425,25 @@ export async function commitBulkHoursImport({ importId, importer, dependencies =
         revalidated.errors,
       );
     }
+    // Si una matrícula cambió de dueño desde la vista previa, no se acredita al usuario anterior.
+    const currentIdByRow = new Map(revalidated.rows.map((row) => [row.row, String(row.userId)]));
+    if (token.rows.some((row) => currentIdByRow.get(row.row) !== String(row.userId))) {
+      throw new BulkHoursImportError(
+        409,
+        "import_conflict",
+        "Los datos cambiaron después de la vista previa. No se agregaron horas.",
+      );
+    }
 
     let adjusted = 0;
     let totalHours = 0;
+    let cappedRows = 0;
+    // Las filas de usuario ya están bloqueadas (loadTargets lock) y cada cuenta aparece una sola vez.
+    const progress = await loadUsersHoursProgress(tx, token.rows.map((row) => row.userId));
     for (const row of token.rows) {
+      const { goal, total } = progress.get(String(row.userId));
+      const credited = capHoursToGoal(row.hours, total, goal);
+      if (credited < row.hours) cappedRows += 1;
       const inserted = await tx.query(
         `INSERT INTO hours_ledger (
            user_id, event_id, hours_delta, reason, source_checkin_id,
@@ -429,7 +452,14 @@ export async function commitBulkHoursImport({ importId, importer, dependencies =
          VALUES ($1, NULL, $2, 'adjustment'::ledger_reason, NULL, $3, $4, $5, $6::uuid)
          ON CONFLICT (request_id) WHERE request_id IS NOT NULL DO NOTHING
          RETURNING id`,
-        [row.userId, row.hours, token.importerUserId, row.motive, token.category, row.requestId],
+        [
+          row.userId,
+          credited,
+          token.importerUserId,
+          `${row.motive}${goalCapNote(credited, row.hours, goal)}`,
+          token.category,
+          row.requestId,
+        ],
       );
       if (!inserted.rows?.[0]) {
         throw new BulkHoursImportError(
@@ -439,14 +469,15 @@ export async function commitBulkHoursImport({ importId, importer, dependencies =
         );
       }
       adjusted += 1;
-      totalHours += row.hours;
+      totalHours += credited;
     }
 
     return {
       ok: true,
       adjusted,
       users: token.summary.users,
-      total_hours: totalHours,
+      total_hours: Math.round(totalHours * 100) / 100,
+      capped_rows: cappedRows,
     };
   });
 }

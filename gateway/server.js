@@ -72,8 +72,16 @@ export function prepareForwardedHeaders(req) {
   req.headers["x-forwarded-for"] = appendForwardedFor(req);
 }
 
+export function parseRequestPath(rawUrl) {
+  try {
+    return new URL(rawUrl || "/", "http://gateway.local").pathname;
+  } catch {
+    return null;
+  }
+}
+
 export function isBackendPath(rawUrl) {
-  const pathname = new URL(rawUrl || "/", "http://gateway.local").pathname;
+  const pathname = parseRequestPath(rawUrl) ?? "/";
   return (
     pathname === "/api" ||
     pathname.startsWith("/api/") ||
@@ -112,7 +120,12 @@ proxy.on("error", (error, req, res) => {
 });
 
 export const server = http.createServer((req, res) => {
-  const pathname = new URL(req.url || "/", "http://gateway.local").pathname;
+  const pathname = parseRequestPath(req.url);
+  if (pathname === null) {
+    res.writeHead(400, { "Content-Type": "application/json; charset=utf-8", "Cache-Control": "no-store" });
+    res.end(JSON.stringify({ ok: false, message: "Solicitud inválida." }));
+    return;
+  }
   if (pathname === "/gateway-health" || pathname === "/health/live") {
     res.writeHead(200, {
       "Content-Type": "application/json; charset=utf-8",
@@ -127,6 +140,10 @@ export const server = http.createServer((req, res) => {
 });
 
 server.on("upgrade", (req, socket, head) => {
+  if (parseRequestPath(req.url) === null) {
+    socket.end("HTTP/1.1 400 Bad Request\r\nConnection: close\r\n\r\n");
+    return;
+  }
   prepareForwardedHeaders(req);
   proxy.ws(req, socket, head, { target: targetFor(req) });
 });

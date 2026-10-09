@@ -1,3 +1,5 @@
+import path from "node:path";
+
 import ROLES from "../catalogs/roles.json" with { type: "json" };
 
 export { ROLES };
@@ -49,6 +51,30 @@ export const BULK_STUDENT_IMPORT_PREVIEW_TTL_SECONDS = Number.isFinite(
   ? Math.min(600, Math.max(60, Math.trunc(bulkStudentImportPreviewTtl)))
   : 600;
 
+// Archivos subidos: el contenido vive en FILE_STORAGE_DIR (volumen Docker) y la tabla files guarda la ubicación.
+export const FILE_STORAGE_DIR = path.resolve(
+  String(process.env.FILE_STORAGE_DIR || "").trim() || path.join(process.cwd(), "storage"),
+);
+const fileUploadMaxBytes = Number(
+  process.env.FILE_UPLOAD_MAX_BYTES || process.env.AFC_EVIDENCE_MAX_FILE_BYTES || 5 * 1024 * 1024,
+);
+export const FILE_UPLOAD_MAX_BYTES = Number.isFinite(fileUploadMaxBytes)
+  ? Math.min(10 * 1024 * 1024, Math.max(1024, Math.trunc(fileUploadMaxBytes)))
+  : 5 * 1024 * 1024;
+export const FILE_ALLOWED_MIME_TYPES = Object.freeze([
+  "application/pdf",
+  "image/png",
+  "image/jpeg",
+]);
+export const FILE_STAGED_TTL_HOURS = 24;
+export const FILE_PURPOSES = Object.freeze({
+  AFC_HOURS_EVIDENCE: "afc_hours_evidence",
+  PARTICIPATION_EVIDENCE: "participation_evidence",
+  REGISTRATION_REQUIREMENT: "registration_requirement",
+  EVENT_COVER: "event_cover",
+  OTHER: "other",
+});
+
 const trustProxyRaw = String(process.env.TRUST_PROXY || "").trim();
 export const TRUST_PROXY = /^\d+$/.test(trustProxyRaw)
   ? Number(trustProxyRaw)
@@ -81,7 +107,9 @@ export const RESUBMISSION_POLICIES = new Set([
 ]);
 export const CANCEL_POLICIES = new Set(["free_cancel", "locked", "penalize_no_show"]);
 
-export const PRIVILEGED_EVENT_CREATOR_ROLES = new Set([ROLES.ADMIN, ROLES.STAFF]);
+// Solo administradores gestionan eventos; el staff únicamente escanea check-ins de su evento asignado.
+export const PRIVILEGED_EVENT_CREATOR_ROLES = new Set([ROLES.ADMIN]);
+export const CHECKIN_SCANNER_ROLES = new Set([ROLES.ADMIN, ROLES.STAFF]);
 
 export const EVENT_LIST_PAGE_SIZE_DEFAULT = 20;
 export const EVENT_LIST_PAGE_SIZE_MAX = 100;

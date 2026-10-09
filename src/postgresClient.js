@@ -4,12 +4,17 @@ const { Pool } = pg;
 
 const DATABASE_URL = process.env.DATABASE_URL;
 
+if (process.env.NODE_ENV === "production" && !DATABASE_URL && !process.env.PGPASSWORD) {
+  throw new Error("PGPASSWORD o DATABASE_URL son obligatorios en producción.");
+}
+
 const PG_CONFIG = {
   connectionString: DATABASE_URL,
   host: process.env.PGHOST || "localhost",
   port: Number(process.env.PGPORT || 5432),
   database: process.env.PGDATABASE || "afc",
   user: process.env.PGUSER || "afc",
+  // Contraseña por defecto solo para desarrollo local.
   password: process.env.PGPASSWORD || "admin",
   max: Number(process.env.PG_POOL_MAX || 10),
   idleTimeoutMillis: Number(process.env.PG_IDLE_TIMEOUT_MS || 30000),

@@ -4,7 +4,12 @@ import bcrypt from "bcryptjs";
 
 import { query, withTransaction } from "../postgresClient.js";
 import { getRedisClient } from "../redisClient.js";
-import { requireAdmin, requireAuth, requireEventManager } from "../middleware/auth.js";
+import {
+  requireAdmin,
+  requireAuth,
+  requireCheckinScanner,
+  requireEventManager,
+} from "../middleware/auth.js";
 import {
   CANCEL_POLICIES,
   DEFAULT_ORG_ID,
@@ -29,8 +34,25 @@ import {
   assertEventCareerAccess,
   canManageEventCareer,
 } from "../services/eventCareerAccess.js";
+import {
+  assertHoursAllowStatus,
+  attachAfcEvidence,
+  normalizeAfcValuationInput,
+  prepareEventHoursValuation,
+} from "../services/eventHoursValuation.js";
+import { loadFileMetadata } from "../services/fileStorageService.js";
+import { capHoursToGoal, goalCapNote, loadUserHoursProgress } from "../services/afcHoursGoal.js";
+import { createOAuthRateLimit } from "../middleware/oauthRateLimit.js";
+import { MAX_PAGE, escapeLikePattern, parsePositiveIntParam } from "../utils/requestParams.js";
 
 const router = Router();
+const limitEventViews = createOAuthRateLimit({
+  limit: 60,
+  windowMs: 60_000,
+  scope: "event-views",
+  code: "event_views_rate_limited",
+  message: "Demasiadas solicitudes. Espera un momento.",
+});
 const COUNTER_TTL_SECONDS = 60 * 5;
 const RECENT_CHECKINS_DEFAULT_LIMIT = 20;
 const RECENT_CHECKINS_MAX_LIMIT = 50;
@@ -845,7 +867,7 @@ export function buildEventConditions({ q, status, category, startsFrom, startsTo
         OR COALESCE(e.description, '') ILIKE $${idx}
         OR COALESCE(e.category, '') ILIKE $${idx})`,
     );
-    params.push(`%${q}%`);
+    params.push(`%${escapeLikePattern(q)}%`);
   }
 
   if (category) {
@@ -901,7 +923,7 @@ async function listEvents({
   const page = Number(pageRaw);
   const requestedPageSize = Number(pageSizeRaw);
 
-  if (!Number.isInteger(page) || page <= 0) {
+  if (!Number.isInteger(page) || page <= 0 || page > MAX_PAGE) {
     throw createHttpError(400, "page inválido.");
   }
   if (!Number.isInteger(requestedPageSize) || requestedPageSize <= 0) {
@@ -956,10 +978,14 @@ async function listEvents({
        su.id AS staff_user_id,
        su.email AS staff_user_email,
        owner_user.career_id AS owner_career_id,
-       owner_career.name AS owner_career_name`
+       owner_career.name AS owner_career_name,
+       e.afc_valuation,
+       e.afc_evidence_file_id`
     : "";
 
-  const staffGroupSql = includeStaff ? ", su.id, owner_user.id, owner_career.id" : "";
+  const staffGroupSql = includeStaff
+    ? ", su.id, owner_user.id, owner_career.id"
+    : "";
   const ownerJoinSql = includeStaff
     ? `LEFT JOIN users owner_user ON owner_user.id = e.created_by
        LEFT JOIN careers owner_career ON owner_career.id = owner_user.career_id`
@@ -1036,7 +1062,7 @@ async function listEvents({
 }
 
 router.get("/api/events", requireAuth, async (req, res) => {
-  const q = String(req.query?.q || "").trim();
+  const q = String(req.query?.q || "").trim().slice(0, 200);
   const status = req.query?.status ? String(req.query.status).trim() : undefined;
   const category = req.query?.category ? String(req.query.category).trim() : undefined;
   const startsFrom = req.query?.starts_from ? parseIsoDateOrNull(req.query.starts_from) : null;
@@ -1088,7 +1114,7 @@ router.get("/api/events", requireAuth, async (req, res) => {
   }
 });
 
-router.post("/api/events/:eventId/view", requireAuth, async (req, res) => {
+router.post("/api/events/:eventId/view", requireAuth, limitEventViews, async (req, res) => {
   const eventId = Number(req.params.eventId);
 
   if (!Number.isInteger(eventId) || eventId <= 0) {
@@ -1096,6 +1122,14 @@ router.post("/api/events/:eventId/view", requireAuth, async (req, res) => {
   }
 
   try {
+    const visible = await query(
+      `SELECT 1 FROM events WHERE id = $1 AND org_id = $2 AND status = 'published' LIMIT 1`,
+      [eventId, DEFAULT_ORG_ID],
+    );
+    if (!visible.rows?.[0]) {
+      return res.status(404).json({ ok: false, message: "Evento no encontrado." });
+    }
+
     const tracked = await trackEventView(eventId);
 
     return res.status(200).json({
@@ -1141,11 +1175,13 @@ router.post("/api/events/:eventId/register", requireAuth, async (req, res) => {
 
   try {
     const created = await withTransaction(async (tx) => {
+      // FOR UPDATE serializa las inscripciones del evento para que el cupo no se rebase en paralelo.
       const eventResult = await tx.query(
         `SELECT id, org_id, status, registration_mode, ends_at, capacity, capacity_enabled
          FROM events
          WHERE id = $1 AND org_id = $2
-         LIMIT 1`,
+         LIMIT 1
+         FOR UPDATE`,
         [eventId, DEFAULT_ORG_ID],
       );
 
@@ -1774,11 +1810,8 @@ router.get("/api/me/registrations", requireAuth, async (req, res) => {
     return res.status(401).json({ ok: false, message: "Sesión inválida." });
   }
 
-  const page = Math.max(1, Number(req.query?.page || 1));
-  const pageSize = Math.min(
-    EVENT_LIST_PAGE_SIZE_MAX,
-    Math.max(1, Number(req.query?.pageSize || EVENT_LIST_PAGE_SIZE_DEFAULT)),
-  );
+  const page = parsePositiveIntParam(req.query?.page, 1, MAX_PAGE);
+  const pageSize = parsePositiveIntParam(req.query?.pageSize, EVENT_LIST_PAGE_SIZE_DEFAULT, EVENT_LIST_PAGE_SIZE_MAX);
   const offset = (page - 1) * pageSize;
 
   try {
@@ -1885,11 +1918,8 @@ router.get("/api/me/hours/history", requireAuth, async (req, res) => {
     return res.status(401).json({ ok: false, message: "Sesión inválida." });
   }
 
-  const page = Math.max(1, Number(req.query?.page || 1));
-  const pageSize = Math.min(
-    EVENT_LIST_PAGE_SIZE_MAX,
-    Math.max(1, Number(req.query?.pageSize || EVENT_LIST_PAGE_SIZE_DEFAULT)),
-  );
+  const page = parsePositiveIntParam(req.query?.page, 1, MAX_PAGE);
+  const pageSize = parsePositiveIntParam(req.query?.pageSize, EVENT_LIST_PAGE_SIZE_DEFAULT, EVENT_LIST_PAGE_SIZE_MAX);
   const offset = (page - 1) * pageSize;
 
   try {
@@ -1914,6 +1944,7 @@ router.get("/api/me/hours/history", requireAuth, async (req, res) => {
 
     const total = Number(countResult.rows?.[0]?.total ?? 0);
     const totalHours = Number(totalHoursResult.rows?.[0]?.total_hours ?? 0);
+    const { goal: hoursGoal } = await loadUserHoursProgress({ query }, userId);
 
     const historyResult = await query(
       `SELECT
@@ -1971,6 +2002,7 @@ router.get("/api/me/hours/history", requireAuth, async (req, res) => {
     return res.status(200).json({
       ok: true,
       total_hours: totalHours,
+      hours_goal: hoursGoal,
       history,
       pagination: {
         page,
@@ -1989,7 +2021,7 @@ router.get("/api/me/hours/history", requireAuth, async (req, res) => {
 });
 
 router.get("/api/admin/events", requireAuth, requireEventManager, async (req, res) => {
-  const q = String(req.query?.q || "").trim();
+  const q = String(req.query?.q || "").trim().slice(0, 200);
   const status = req.query?.status ? String(req.query.status).trim() : undefined;
   const category = req.query?.category ? String(req.query.category).trim() : undefined;
   const startsFrom = req.query?.starts_from ? parseIsoDateOrNull(req.query.starts_from) : null;
@@ -2086,7 +2118,7 @@ router.get(
       }
       assertEventCareerAccess(req.auth.careerId, eventRow.owner_career_id);
 
-      const [sessionsResult, geoResult] = await Promise.all([
+      const [sessionsResult, geoResult, afcEvidence, hasAttendance] = await Promise.all([
         query(
           `SELECT id, event_id, starts_at, ends_at, label, hours_value, created_at
            FROM event_sessions
@@ -2101,6 +2133,8 @@ router.get(
            LIMIT 1`,
           [eventId],
         ),
+        loadFileMetadata({ query }, eventRow.afc_evidence_file_id),
+        eventHasAttendance({ query }, eventId),
       ]);
 
       const staffUser =
@@ -2112,10 +2146,12 @@ router.get(
         ...eventRow,
         staff_user: staffUser,
         geo: geofence,
+        afc_evidence: afcEvidence,
       });
 
       delete event.staff_user_id;
       delete event.staff_user_email;
+      event.has_attendance = hasAttendance;
 
       return res.status(200).json({
         ok: true,
@@ -2140,8 +2176,8 @@ router.get(
 
 router.get("/api/admin/requests/pending", requireAuth, requireEventManager, async (req, res) => {
   const eventId = req.query?.event_id ? Number(req.query.event_id) : null;
-  const page = Math.max(1, Number(req.query?.page || 1));
-  const pageSize = Math.min(100, Math.max(1, Number(req.query?.pageSize || 30)));
+  const page = parsePositiveIntParam(req.query?.page, 1, MAX_PAGE);
+  const pageSize = parsePositiveIntParam(req.query?.pageSize, 30, 100);
   const offset = (page - 1) * pageSize;
 
   if (req.query?.event_id && (!Number.isInteger(eventId) || eventId <= 0)) {
@@ -2619,7 +2655,7 @@ router.get(
       ? new Date(String(req.query.from))
       : new Date(Date.now() - TIMESERIES_DEFAULT_WINDOW_HOURS * 60 * 60 * 1000);
     const to = req.query?.to ? new Date(String(req.query.to)) : new Date();
-    const limit = Math.min(2000, Math.max(1, Number(req.query?.limit || 500)));
+    const limit = parsePositiveIntParam(req.query?.limit, 500, 2000);
 
     if (!Number.isInteger(eventId) || eventId <= 0) {
       return res.status(400).json({ ok: false, message: "eventId inválido." });
@@ -2795,10 +2831,33 @@ router.get(
   },
 );
 
+const MAX_CHECKIN_ACCURACY_M = 1_000_000;
+
+// La ubicación es solo evidencia: un valor inválido se descarta en vez de romper el check-in.
+// checkins.accuracy_m es INTEGER y client_lat/lng NUMERIC(9,6); los navegadores reportan decimales.
+export function normalizeCheckinLocation(body) {
+  const toFiniteOrNull = (value) => {
+    if (value === undefined || value === null || value === "" || typeof value === "boolean") return null;
+    const number = Number(value);
+    return Number.isFinite(number) ? number : null;
+  };
+  const lat = toFiniteOrNull(body?.client_lat ?? body?.lat);
+  const lng = toFiniteOrNull(body?.client_lng ?? body?.lng);
+  const coordinatesValid = lat !== null && lng !== null && Math.abs(lat) <= 90 && Math.abs(lng) <= 180;
+  const accuracy = toFiniteOrNull(body?.accuracy_m ?? body?.accuracy);
+  const accuracyValid = accuracy !== null && accuracy >= 0 && accuracy <= MAX_CHECKIN_ACCURACY_M;
+
+  return {
+    clientLat: coordinatesValid ? Number(lat.toFixed(6)) : null,
+    clientLng: coordinatesValid ? Number(lng.toFixed(6)) : null,
+    accuracyM: coordinatesValid && accuracyValid ? Math.round(accuracy) : null,
+  };
+}
+
 router.post(
   "/api/admin/events/checkins/scan",
   requireAuth,
-  requireEventManager,
+  requireCheckinScanner,
   async (req, res) => {
     const ticketCode = String(req.body?.ticket_code ?? req.body?.ticketCode ?? "").trim();
     const scannerAdminIdRaw = req.auth?.userId;
@@ -2809,16 +2868,7 @@ router.post(
         ? null
         : Number(staffUserIdInput);
 
-    const clientLatRaw = req.body?.client_lat ?? req.body?.lat;
-    const clientLngRaw = req.body?.client_lng ?? req.body?.lng;
-    const accuracyRaw = req.body?.accuracy_m ?? req.body?.accuracy;
-
-    const clientLat =
-      clientLatRaw === undefined || clientLatRaw === null ? null : Number(clientLatRaw);
-    const clientLng =
-      clientLngRaw === undefined || clientLngRaw === null ? null : Number(clientLngRaw);
-    const accuracyM =
-      accuracyRaw === undefined || accuracyRaw === null ? null : Number(accuracyRaw);
+    const { clientLat, clientLng, accuracyM } = normalizeCheckinLocation(req.body);
 
     if (!ticketCode) {
       return res.status(400).json({ ok: false, message: "ticket_code es requerido." });
@@ -2882,7 +2932,10 @@ router.post(
         if (!event) {
           throw createHttpError(404, "Evento no encontrado.");
         }
-        assertEventCareerAccess(req.auth.careerId, event.owner_career_id);
+        // El staff se autoriza por asignación al evento (validada abajo), no por carrera.
+        if (req.auth?.role !== ROLES.STAFF) {
+          assertEventCareerAccess(req.auth.careerId, event.owner_career_id);
+        }
         if (event.status !== "published") {
           throw createHttpError(
             409,
@@ -3018,6 +3071,10 @@ router.post(
         let geoReason = "ok";
         let distanceM = null;
 
+        // Validación de geocerca desactivada temporalmente: en el evento piloto el staff no podía
+        // registrar check-ins cuando su dispositivo tenía la geolocalización activa.
+        // Para reactivarla, restaurar el bloque siguiente:
+        /*
         if (event.geo_enforced) {
           const geoConfigResult = await tx.query(
             `SELECT center_lat, center_lng, radius_m, strict_accuracy_m
@@ -3053,12 +3110,13 @@ router.post(
             geoOk = false;
             geoReason = "low_accuracy";
           } else {
-            distanceM = haversineDistanceMeters(
+            // checkins.distance_m es INTEGER: redondear antes de guardar.
+            distanceM = Math.round(haversineDistanceMeters(
               Number(clientLat),
               Number(clientLng),
               Number(geo.center_lat),
               Number(geo.center_lng),
-            );
+            ));
 
             if (distanceM > Number(geo.radius_m)) {
               result = "rejected";
@@ -3068,6 +3126,7 @@ router.post(
             }
           }
         }
+        */
 
         const checkinResult = existingCheckin
           ? await tx.query(
@@ -3148,6 +3207,13 @@ router.post(
             session.hours_value !== null && session.hours_value !== undefined
               ? Number(session.hours_value)
               : Number(event.hours_value);
+          const progress = await loadUserHoursProgress(tx, ticket.user_id, { lock: true });
+          const creditedHours = capHoursToGoal(
+            Number.isNaN(grantedHours) ? 0 : grantedHours,
+            progress.total,
+            progress.goal,
+          );
+          const capNote = goalCapNote(creditedHours, grantedHours, progress.goal);
 
           await tx.query(
             `INSERT INTO hours_ledger (
@@ -3165,10 +3231,10 @@ router.post(
             [
               ticket.user_id,
               resolvedEventId,
-              Number.isNaN(grantedHours) ? 0 : grantedHours,
+              creditedHours,
               insertedCheckin.id,
               scannerAdminId,
-              `Check-in staff session=${session.id}`,
+              `Check-in staff session=${session.id}${capNote}`,
             ],
           );
 
@@ -3265,18 +3331,45 @@ router.post(
   },
 );
 
+async function prepareCreatedEventValuation(tx, eventInput) {
+  if (!eventInput.afc) {
+    assertHoursAllowStatus(eventInput.hours_value, eventInput.status);
+    return;
+  }
+  const prepared = await prepareEventHoursValuation(tx, { existing: null, input: eventInput.afc });
+  assertHoursAllowStatus(prepared.hoursValue, eventInput.status);
+  eventInput.hours_value = prepared.hoursValue;
+  eventInput.afc_valuation = prepared.valuation;
+  eventInput.afc_evidence_file_id = prepared.evidenceFileId;
+}
+
+async function applyCreatedEventEvidence(tx, eventRow, eventInput, authUserId) {
+  if (!eventInput.afc_evidence_file_id) return;
+  await attachAfcEvidence(tx, {
+    eventId: eventRow.id,
+    fileId: eventInput.afc_evidence_file_id,
+    authUserId,
+  });
+  const updated = await tx.query(
+    `UPDATE events SET afc_evidence_file_id = $2 WHERE id = $1 RETURNING afc_evidence_file_id`,
+    [eventRow.id, eventInput.afc_evidence_file_id],
+  );
+  Object.assign(eventRow, updated.rows[0]);
+}
+
 async function createEventRecords(tx, eventInput, rawBody, authUserId, managerCareerId) {
   const category = await ensureEventCategoryExists(eventInput.category, tx);
+  await prepareCreatedEventValuation(tx, eventInput);
   const eventInsertResult = await tx.query(
     `INSERT INTO events (
       org_id, title, description, category, location, organizer, starts_at, ends_at,
       hours_value, capacity, capacity_enabled, status, registration_mode,
       resubmission_policy, allow_self_checkin, geo_enforced, cancel_policy,
-      cancel_deadline, cover_image_url, attributes, created_by
+      cancel_deadline, cover_image_url, attributes, created_by, afc_valuation
     ) VALUES (
       $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12::event_status,
       $13::registration_mode, $14::resubmission_policy, $15, $16,
-      $17::cancel_policy, $18, $19, $20::jsonb, $21
+      $17::cancel_policy, $18, $19, $20::jsonb, $21, $22::jsonb
     ) RETURNING *`,
     [
       DEFAULT_ORG_ID, eventInput.title, eventInput.description, category,
@@ -3285,9 +3378,11 @@ async function createEventRecords(tx, eventInput, rawBody, authUserId, managerCa
       eventInput.registration_mode, eventInput.resubmission_policy, eventInput.allow_self_checkin,
       eventInput.geo_enforced, eventInput.cancel_policy, eventInput.cancel_deadline,
       eventInput.cover_image_url, JSON.stringify(eventInput.attributes), authUserId,
+      eventInput.afc_valuation ? JSON.stringify(eventInput.afc_valuation) : null,
     ],
   );
   const eventRow = eventInsertResult.rows[0];
+  await applyCreatedEventEvidence(tx, eventRow, eventInput, authUserId);
 
   const staffUserIdInput = rawBody?.staff_user_id ?? rawBody?.staffUserId ?? rawBody?.staff_user;
   const assignStaffRaw = rawBody?.assign_staff ?? rawBody?.assignStaff;
@@ -3457,7 +3552,7 @@ router.post("/api/admin/events/bulk", requireAuth, requireEventManager, async (r
       success: false,
       code: err?.code ?? undefined,
       message: statusCode === 500 ? "No se pudo importar el archivo. No se creó ningún evento." : err.message,
-      errors: index === null ? [] : [{ index, line: index + 2, title: items[index]?.title || "Evento sin título", message: err.message }],
+      errors: index === null ? [] : [{ index, line: index + 2, title: items[index]?.title || "Evento sin título", message: statusCode === 500 ? "No se pudo crear este evento." : err.message }],
     });
   }
 });
@@ -3480,6 +3575,7 @@ router.post("/api/admin/events", requireAuth, requireEventManager, async (req, r
     const created = await withTransaction(async (tx) => {
       const managerCareerId = await loadEventManagerCareerId(tx, authUserId);
       const category = await ensureEventCategoryExists(eventInput.category, tx);
+      await prepareCreatedEventValuation(tx, eventInput);
 
       const eventInsertResult = await tx.query(
         `INSERT INTO events (
@@ -3503,10 +3599,11 @@ router.post("/api/admin/events", requireAuth, requireEventManager, async (req, r
           cancel_deadline,
           cover_image_url,
           attributes,
-          created_by
+          created_by,
+          afc_valuation
         ) VALUES (
           $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12::event_status, $13::registration_mode,
-          $14::resubmission_policy, $15, $16, $17::cancel_policy, $18, $19, $20::jsonb, $21
+          $14::resubmission_policy, $15, $16, $17::cancel_policy, $18, $19, $20::jsonb, $21, $22::jsonb
         )
         RETURNING *`,
         [
@@ -3531,10 +3628,12 @@ router.post("/api/admin/events", requireAuth, requireEventManager, async (req, r
           eventInput.cover_image_url,
           JSON.stringify(eventInput.attributes),
           authUserId,
+          eventInput.afc_valuation ? JSON.stringify(eventInput.afc_valuation) : null,
         ],
       );
 
       const eventRow = eventInsertResult.rows[0];
+      await applyCreatedEventEvidence(tx, eventRow, eventInput, authUserId);
 
       const staffUserIdInput =
         req.body?.staff_user_id ?? req.body?.staffUserId ?? req.body?.staff_user;
@@ -3765,6 +3864,47 @@ router.post("/api/admin/events", requireAuth, requireEventManager, async (req, r
   }
 });
 
+async function eventHasAttendance(db, eventId) {
+  const result = await db.query(
+    `SELECT EXISTS (
+              SELECT 1 FROM checkins WHERE event_id = $1 AND result = 'accepted'::checkin_result
+            )
+         OR EXISTS (SELECT 1 FROM hours_ledger WHERE event_id = $1) AS has_attendance`,
+    [eventId],
+  );
+  return Boolean(result.rows?.[0]?.has_attendance);
+}
+
+const ATTENDANCE_LOCKED_STATUSES = new Set(["ended", "cancelled"]);
+
+// Las horas ya acreditadas no se recalculan; con asistencias solo se corrigen con ajuste manual.
+export function assertAttendanceLockedFields(existingEvent, updates) {
+  const prefix = "El evento ya tiene asistencias registradas";
+  const dateChanged = (field) =>
+    updates[field] !== undefined &&
+    parseIsoDateOrNull(updates[field])?.getTime() !== new Date(existingEvent[field]).getTime();
+  if (dateChanged("starts_at") || dateChanged("ends_at")) {
+    throw createHttpError(409, `${prefix}: no se pueden cambiar sus fechas.`);
+  }
+
+  const previousHours = existingEvent.hours_value === null ? null : Number(existingEvent.hours_value);
+  const hoursChanged =
+    updates.hours_value !== undefined && parsePlainDecimalOrNull(updates.hours_value) !== previousHours;
+  if ((updates.afc_valuation !== undefined && updates.afc_valuation !== null) || hoursChanged) {
+    throw createHttpError(
+      409,
+      `${prefix}: no se pueden cambiar sus horas ni su valoración AFC. Usa el ajuste manual de horas.`,
+    );
+  }
+
+  if (updates.status !== undefined) {
+    const nextStatus = String(updates.status).trim();
+    if (nextStatus !== String(existingEvent.status) && !ATTENDANCE_LOCKED_STATUSES.has(nextStatus)) {
+      throw createHttpError(409, `${prefix}: solo puede marcarse como finalizado o cancelado.`);
+    }
+  }
+}
+
 router.put("/api/admin/events/:eventId", requireAuth, requireAdmin, async (req, res) => {
   const eventId = Number(req.params.eventId);
 
@@ -3800,6 +3940,9 @@ router.put("/api/admin/events/:eventId", requireAuth, requireAdmin, async (req, 
         throw notFoundError;
       }
       assertEventCareerAccess(req.auth.careerId, existingEvent.owner_career_id);
+      if (await eventHasAttendance(tx, eventId)) {
+        assertAttendanceLockedFields(existingEvent, updates);
+      }
 
       const startsAt =
         updates.starts_at !== undefined
@@ -3828,16 +3971,50 @@ router.put("/api/admin/events/:eventId", requireAuth, requireAdmin, async (req, 
         throw validationError;
       }
 
-      const hoursValue =
-        updates.hours_value !== undefined
-          ? parsePlainDecimalOrNull(updates.hours_value)
-          : Number(existingEvent.hours_value);
-      if (hoursValue === null || hoursValue < 0 || hoursValue > MAX_EVENT_HOURS) {
-        const validationError = new Error(
-          `Las horas acreditables deben ser un decimal entre 0 y ${MAX_EVENT_HOURS}, sin letras ni notación científica.`,
-        );
-        validationError.statusCode = 400;
-        throw validationError;
+      let afcInput = null;
+      if (updates.afc_valuation !== undefined && updates.afc_valuation !== null) {
+        const normalizedAfc = normalizeAfcValuationInput(updates.afc_valuation);
+        if (normalizedAfc.error) throw createHttpError(400, normalizedAfc.error);
+        afcInput = normalizedAfc.value;
+      }
+      const isAfcManaged = Boolean(afcInput || existingEvent.afc_valuation);
+
+      let hoursValue;
+      let afcValuation = existingEvent.afc_valuation ?? null;
+      let afcEvidenceFileId = existingEvent.afc_evidence_file_id ?? null;
+      if (afcInput) {
+        const prepared = await prepareEventHoursValuation(tx, { existing: existingEvent, input: afcInput });
+        if (prepared.evidenceFileId) {
+          await attachAfcEvidence(tx, {
+            eventId,
+            fileId: prepared.evidenceFileId,
+            authUserId: req.auth?.userId,
+          });
+        }
+        hoursValue = prepared.hoursValue;
+        afcValuation = prepared.valuation;
+        afcEvidenceFileId = prepared.evidenceFileId;
+      } else if (existingEvent.afc_valuation) {
+        // Las horas de eventos valorados solo cambian con un cambio explícito de criterio.
+        hoursValue =
+          existingEvent.hours_value === null ? null : Number(existingEvent.hours_value);
+      } else {
+        hoursValue =
+          updates.hours_value !== undefined
+            ? parsePlainDecimalOrNull(updates.hours_value)
+            : existingEvent.hours_value === null
+              ? null
+              : Number(existingEvent.hours_value);
+        if (
+          updates.hours_value !== undefined &&
+          (hoursValue === null || hoursValue < 0 || hoursValue > MAX_EVENT_HOURS)
+        ) {
+          const validationError = new Error(
+            `Las horas acreditables deben ser un decimal entre 0 y ${MAX_EVENT_HOURS}, sin letras ni notación científica.`,
+          );
+          validationError.statusCode = 400;
+          throw validationError;
+        }
       }
 
       const capacityEnabled =
@@ -3890,6 +4067,7 @@ router.put("/api/admin/events/:eventId", requireAuth, requireAdmin, async (req, 
         validationError.statusCode = 400;
         throw validationError;
       }
+      assertHoursAllowStatus(hoursValue, status);
 
       const registrationMode =
         updates.registration_mode !== undefined
@@ -4043,10 +4221,13 @@ router.put("/api/admin/events/:eventId", requireAuth, requireAdmin, async (req, 
             : String(updates.organizer || "").trim()
           : existingEvent.organizer;
 
-      const geoEnforced =
-        updates.geo_enforced !== undefined
-          ? Boolean(updates.geo_enforced)
-          : Boolean(existingEvent.geo_enforced);
+      // Geocerca desactivada temporalmente: con la ubicación activa en el dispositivo el staff no podía
+      // registrar check-ins. Para reactivarla, restaurar:
+      // const geoEnforced =
+      //   updates.geo_enforced !== undefined
+      //     ? Boolean(updates.geo_enforced)
+      //     : Boolean(existingEvent.geo_enforced);
+      const geoEnforced = false;
 
       const allowSelfCheckin =
         updates.allow_self_checkin !== undefined
@@ -4080,7 +4261,9 @@ router.put("/api/admin/events/:eventId", requireAuth, requireAdmin, async (req, 
              cancel_policy = $16::cancel_policy,
              cancel_deadline = $17,
              cover_image_url = $18,
-             attributes = $19::jsonb
+             attributes = $19::jsonb,
+             afc_valuation = $22::jsonb,
+             afc_evidence_file_id = $23
          WHERE id = $20 AND org_id = $21`,
         [
           updates.title !== undefined ? String(updates.title || "").trim() : existingEvent.title,
@@ -4108,9 +4291,14 @@ router.put("/api/admin/events/:eventId", requireAuth, requireAdmin, async (req, 
           JSON.stringify(normalizedAttributes),
           eventId,
           DEFAULT_ORG_ID,
+          afcValuation ? JSON.stringify(afcValuation) : null,
+          afcEvidenceFileId,
         ],
       );
 
+      // Geocerca desactivada (ver geoEnforced arriba): no se crean ni modifican configuraciones en event_geo;
+      // las existentes se conservan sin aplicarse. Para reactivarla, restaurar el bloque:
+      /*
       const existingGeoResult = await tx.query(
         `SELECT * FROM event_geo WHERE event_id = $1 LIMIT 1`,
         [eventId],
@@ -4175,6 +4363,7 @@ router.put("/api/admin/events/:eventId", requireAuth, requireAdmin, async (req, 
           throw validationError;
         }
       }
+      */
 
       if (updates.sessions !== undefined) {
         if (!Array.isArray(updates.sessions) || updates.sessions.length === 0) {
@@ -4196,11 +4385,16 @@ router.put("/api/admin/events/:eventId", requireAuth, requireAdmin, async (req, 
               ? null
               : String(session.label).trim();
           const sessionHoursValue =
-            session?.hours_value === undefined || session?.hours_value === null
+            isAfcManaged || session?.hours_value === undefined || session?.hours_value === null
               ? null
               : parsePlainDecimalOrNull(session.hours_value);
 
-          if (session?.hours_value !== undefined && session?.hours_value !== null && sessionHoursValue === null) {
+          if (
+            !isAfcManaged &&
+            session?.hours_value !== undefined &&
+            session?.hours_value !== null &&
+            sessionHoursValue === null
+          ) {
             const validationError = new Error(
               `Las horas acreditables de la sesión ${i + 1} deben ser un decimal entre 0 y ${MAX_EVENT_HOURS}, sin letras ni notación científica.`,
             );
@@ -4249,20 +4443,58 @@ router.put("/api/admin/events/:eventId", requireAuth, requireAdmin, async (req, 
           seenDays.add(dayKey);
         }
 
-        await tx.query(`DELETE FROM event_sessions WHERE event_id = $1`, [eventId]);
+        // Borrar event_sessions elimina en cascada los check-ins: con check-ins solo se actualiza la etiqueta.
+        const existingSessionsResult = await tx.query(
+          `SELECT s.id, s.starts_at, s.ends_at, s.hours_value,
+                  EXISTS (SELECT 1 FROM checkins c WHERE c.session_id = s.id) AS has_checkins
+           FROM event_sessions s
+           WHERE s.event_id = $1
+           ORDER BY s.starts_at ASC, s.id ASC`,
+          [eventId],
+        );
+        const existingSessions = existingSessionsResult.rows;
+        const eventHasCheckins = existingSessions.some((row) => row.has_checkins);
 
-        for (const session of normalizedSessions) {
-          await tx.query(
-            `INSERT INTO event_sessions (event_id, starts_at, ends_at, label, hours_value)
-             VALUES ($1, $2, $3, $4, $5)`,
-            [
-              eventId,
-              session.starts_at,
-              session.ends_at,
-              session.label,
-              session.hours_value,
-            ],
-          );
+        if (eventHasCheckins) {
+          const sortedNext = [...normalizedSessions].sort((a, b) => a.starts_at - b.starts_at);
+          const toHours = (value) => (value === null || value === undefined ? null : Number(value));
+          const sameSchedule =
+            sortedNext.length === existingSessions.length &&
+            sortedNext.every(
+              (session, index) =>
+                session.starts_at.getTime() === new Date(existingSessions[index].starts_at).getTime() &&
+                session.ends_at.getTime() === new Date(existingSessions[index].ends_at).getTime() &&
+                toHours(session.hours_value) === toHours(existingSessions[index].hours_value),
+            );
+          if (!sameSchedule) {
+            const conflictError = new Error(
+              "El evento ya tiene asistencias registradas: no se pueden agregar, quitar ni cambiar las fechas u horas de sus sesiones.",
+            );
+            conflictError.statusCode = 409;
+            throw conflictError;
+          }
+          for (let i = 0; i < sortedNext.length; i += 1) {
+            await tx.query(
+              `UPDATE event_sessions SET label = $2 WHERE id = $1`,
+              [existingSessions[i].id, sortedNext[i].label],
+            );
+          }
+        } else {
+          await tx.query(`DELETE FROM event_sessions WHERE event_id = $1`, [eventId]);
+
+          for (const session of normalizedSessions) {
+            await tx.query(
+              `INSERT INTO event_sessions (event_id, starts_at, ends_at, label, hours_value)
+               VALUES ($1, $2, $3, $4, $5)`,
+              [
+                eventId,
+                session.starts_at,
+                session.ends_at,
+                session.label,
+                session.hours_value,
+              ],
+            );
+          }
         }
       }
 
@@ -4294,8 +4526,10 @@ router.put("/api/admin/events/:eventId", requireAuth, requireAdmin, async (req, 
         [eventId],
       );
 
+      const afcEvidence = await loadFileMetadata(tx, eventResult.rows[0]?.afc_evidence_file_id);
+
       return {
-        event: eventResult.rows[0],
+        event: { ...eventResult.rows[0], afc_evidence: afcEvidence },
         sessions: sessionsResult.rows,
         geofence: geoResult.rows?.[0] ?? null,
       };
@@ -4321,8 +4555,13 @@ router.put("/api/admin/events/:eventId", requireAuth, requireAdmin, async (req, 
     if (err?.statusCode === 404) {
       return res.status(404).json({ ok: false, success: false, message: err.message });
     }
-    if (err?.statusCode === 400) {
-      return res.status(400).json({ ok: false, success: false, message: err.message });
+    if (err?.statusCode === 400 || err?.statusCode === 409) {
+      return res.status(err.statusCode).json({
+        ok: false,
+        success: false,
+        code: err.code ?? undefined,
+        message: err.message,
+      });
     }
     if (err?.code === "23503") {
       return res.status(400).json({
@@ -4371,13 +4610,17 @@ router.delete(
         }
         assertEventCareerAccess(req.auth.careerId, existingEvent.owner_career_id);
 
-        const deletedHoursResult = await tx.query(
-          `DELETE FROM hours_ledger
-           WHERE event_id = $1`,
-          [eventId],
-        );
+        // Las horas se acreditan al hacer check-in; eliminar el evento borraba el
+        // hours_ledger y los check-ins. Con asistencia registrada solo se permite cancelarlo.
+        if (await eventHasAttendance(tx, eventId)) {
+          const conflictError = new Error(
+            "El evento ya tiene asistencias u horas acreditadas y no puede eliminarse. Cancélalo en su lugar para conservar el historial.",
+          );
+          conflictError.statusCode = 409;
+          throw conflictError;
+        }
 
-        // También elimina check-ins asociados a sesiones de este evento.
+        // Sin asistencias: se pueden eliminar sesiones y evento.
         await tx.query(
           `DELETE FROM event_sessions
            WHERE event_id = $1`,
@@ -4393,7 +4636,6 @@ router.delete(
 
         return {
           event: deletedEventResult.rows[0],
-          deletedHoursCount: deletedHoursResult.rowCount || 0,
         };
       });
 
@@ -4403,9 +4645,12 @@ router.delete(
         ok: true,
         message: "Evento eliminado correctamente.",
         event: deleted.event,
-        deletedHoursCount: deleted.deletedHoursCount,
+        deletedHoursCount: 0,
       });
     } catch (err) {
+      if (err?.statusCode === 409) {
+        return res.status(409).json({ ok: false, code: "event_has_attendance", message: err.message });
+      }
       if (err?.statusCode === 403) {
         return res.status(403).json({ ok: false, code: err.code, message: err.message });
       }

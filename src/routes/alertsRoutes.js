@@ -1,7 +1,11 @@
 import { Router } from "express";
 
 import { getRedisClient } from "../redisClient.js";
+import { query } from "../postgresClient.js";
+import { ROLES } from "../config/appConfig.js";
 import { requireAdmin, requireAuth } from "../middleware/auth.js";
+import { isGlobalCareerAdmin, normalizeCareerId } from "../services/adminUserCareerScope.js";
+import { MAX_PAGE, parsePositiveIntParam } from "../utils/requestParams.js";
 
 const router = Router();
 const ALERTS_SEQ_KEY = "alerts:seq";
@@ -87,6 +91,65 @@ async function getAlertById(redis, id) {
   }
 }
 
+async function loadUsersById(userIds) {
+  const ids = [...new Set(userIds.filter(Boolean).map(String))].filter((id) => /^\d+$/u.test(id));
+  if (ids.length === 0) return new Map();
+  const result = await query(
+    `SELECT id::text AS id, email, career_id FROM users WHERE id = ANY($1::bigint[])`,
+    [ids],
+  );
+  return new Map(result.rows.map((row) => [row.id, row]));
+}
+
+// Alertas anteriores a este cambio no guardaban correo ni carrera: se toman del usuario que las creó.
+async function withAuthorInfo(alerts) {
+  const missing = alerts.filter((alert) => !alert.created_by_email || alert.career_id === undefined);
+  const users = await loadUsersById(missing.map((alert) => alert.created_by));
+  return alerts.map((alert) => {
+    const author = users.get(String(alert.created_by));
+    return {
+      ...alert,
+      created_by_email: alert.created_by_email ?? author?.email ?? null,
+      career_id: alert.career_id !== undefined ? alert.career_id : normalizeCareerId(author?.career_id),
+    };
+  });
+}
+
+export function canManageAlert(auth, alert) {
+  if (isGlobalCareerAdmin(auth)) return true;
+  if (auth?.role !== ROLES.ADMIN) return false;
+  const careerId = normalizeCareerId(auth?.careerId);
+  return careerId !== null && careerId === normalizeCareerId(alert?.career_id);
+}
+
+// Alumnos y visitantes ven la alerta sin datos del autor.
+function presentAlert(auth, alert) {
+  if (auth?.role !== ROLES.ADMIN) {
+    const { created_by: _by, created_by_email: _email, updated_by: _updated, career_id: _career, ...publicAlert } = alert;
+    return publicAlert;
+  }
+  return { ...alert, can_manage: canManageAlert(auth, alert) };
+}
+
+async function loadManageableAlert(redis, alertId, auth, res) {
+  const existing = await getAlertById(redis, alertId);
+  if (!existing) {
+    await redis.zRem(ALERTS_INDEX_KEY, String(alertId));
+    res.status(404).json({ ok: false, message: "Alerta no encontrada." });
+    return null;
+  }
+  const [alert] = await withAuthorInfo([existing]);
+  if (!canManageAlert(auth, alert)) {
+    res.status(403).json({
+      ok: false,
+      code: "alert_career_forbidden",
+      message: "Solo los administradores de la carrera que publicó la alerta o el superadmin pueden modificarla.",
+    });
+    return null;
+  }
+  return alert;
+}
+
 async function saveAlert(redis, alert) {
   await redis.set(alertKey(alert.id), JSON.stringify(alert));
 
@@ -110,11 +173,8 @@ router.get("/api/alerts", requireAuth, async (req, res) => {
     return res.status(503).json({ ok: false, message: "Redis no está listo." });
   }
 
-  const page = Math.max(1, Number(req.query?.page || 1));
-  const pageSize = Math.min(
-    ALERTS_PAGE_SIZE_MAX,
-    Math.max(1, Number(req.query?.pageSize || ALERTS_PAGE_SIZE_DEFAULT)),
-  );
+  const page = parsePositiveIntParam(req.query?.page, 1, MAX_PAGE);
+  const pageSize = parsePositiveIntParam(req.query?.pageSize, ALERTS_PAGE_SIZE_DEFAULT, ALERTS_PAGE_SIZE_MAX);
 
   const includeExpired = parseBooleanInput(req.query?.includeExpired, false);
 
@@ -140,7 +200,9 @@ router.get("/api/alerts", requireAuth, async (req, res) => {
 
     const total = rows.length;
     const offset = (page - 1) * pageSize;
-    const alerts = rows.slice(offset, offset + pageSize);
+    const alerts = (await withAuthorInfo(rows.slice(offset, offset + pageSize))).map((alert) =>
+      presentAlert(req.auth, alert),
+    );
 
     return res.status(200).json({
       ok: true,
@@ -176,12 +238,13 @@ router.get("/api/alerts/:alertId", requireAuth, async (req, res) => {
       return res.status(404).json({ ok: false, message: "Alerta no encontrada." });
     }
 
+    const [withAuthor] = await withAuthorInfo([alert]);
     return res.status(200).json({
       ok: true,
-      alert: {
-        ...alert,
+      alert: presentAlert(req.auth, {
+        ...withAuthor,
         is_expired: new Date(alert.expires_at) <= new Date(),
-      },
+      }),
     });
   } catch (err) {
     console.error("Error en GET /api/alerts/:alertId:", err.message);
@@ -201,6 +264,8 @@ router.post("/api/admin/alerts", requireAuth, requireAdmin, async (req, res) => 
   }
 
   try {
+    const users = await loadUsersById([req.auth.userId]);
+    const author = users.get(String(req.auth.userId));
     const nextId = await redis.incr(ALERTS_SEQ_KEY);
     const nowIso = new Date().toISOString();
 
@@ -214,6 +279,8 @@ router.post("/api/admin/alerts", requireAuth, requireAdmin, async (req, res) => 
       created_at: nowIso,
       updated_at: nowIso,
       created_by: req.auth.userId,
+      created_by_email: author?.email ?? null,
+      career_id: normalizeCareerId(req.auth.careerId),
     };
 
     await saveAlert(redis, alert);
@@ -251,17 +318,15 @@ router.put("/api/admin/alerts/:alertId", requireAuth, requireAdmin, async (req, 
   }
 
   try {
-    const existing = await getAlertById(redis, alertId);
-    if (!existing) {
-      await redis.zRem(ALERTS_INDEX_KEY, String(alertId));
-      return res.status(404).json({ ok: false, message: "Alerta no encontrada." });
-    }
+    const existing = await loadManageableAlert(redis, alertId, req.auth, res);
+    if (!existing) return undefined;
 
     const updated = {
       ...existing,
       ...parsed.value,
       id: alertId,
       updated_at: new Date().toISOString(),
+      updated_by: req.auth.userId,
     };
 
     await saveAlert(redis, updated);
@@ -293,11 +358,8 @@ router.delete("/api/admin/alerts/:alertId", requireAuth, requireAdmin, async (re
   }
 
   try {
-    const existing = await getAlertById(redis, alertId);
-    if (!existing) {
-      await redis.zRem(ALERTS_INDEX_KEY, String(alertId));
-      return res.status(404).json({ ok: false, message: "Alerta no encontrada." });
-    }
+    const existing = await loadManageableAlert(redis, alertId, req.auth, res);
+    if (!existing) return undefined;
 
     await redis.del(alertKey(alertId));
     await redis.zRem(ALERTS_INDEX_KEY, String(alertId));

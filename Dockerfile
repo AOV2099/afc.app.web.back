@@ -27,6 +27,8 @@ ENV HEALTHCHECK_TIMEOUT_MS="5000"
 ENV BULK_STUDENT_IMPORT_MAX_FILE_BYTES="2097152"
 ENV BULK_STUDENT_IMPORT_MAX_ROWS="1000"
 ENV BULK_STUDENT_IMPORT_PREVIEW_TTL_SECONDS="600"
+ENV FILE_STORAGE_DIR="/app/storage"
+ENV FILE_UPLOAD_MAX_BYTES="5242880"
 ENV TRUST_PROXY=""
 ENV CORS_ALLOW_ANY_ORIGIN="false"
 ENV CORS_ORIGIN=""
@@ -36,5 +38,11 @@ ENV AFC_FRONT_TARGET="http://afc-front:3000"
 ENV AFC_BACK_TARGET="http://afc-back:3000"
 
 EXPOSE 3000 3010
+
+# Archivos subidos (tabla files); montar un volumen para conservarlos entre despliegues.
+RUN mkdir -p /app/storage && chown node:node /app/storage
+VOLUME ["/app/storage"]
+
+USER node
 
 CMD ["npm", "start"]

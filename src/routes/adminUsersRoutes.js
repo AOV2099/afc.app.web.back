@@ -5,6 +5,7 @@ import crypto from "node:crypto";
 import { query, withTransaction } from "../postgresClient.js";
 import { requireAuth, requireCareerAdmin } from "../middleware/auth.js";
 import { createOAuthRateLimit } from "../middleware/oauthRateLimit.js";
+import { MAX_PAGE, escapeLikePattern, parsePositiveIntParam } from "../utils/requestParams.js";
 import {
   ALLOWED_MEMBERSHIP_ROLES,
   BULK_STUDENT_IMPORT_MAX_FILE_BYTES,
@@ -316,9 +317,9 @@ router.post(
 );
 
 router.get("/api/admin/users", requireAuth, requireCareerAdmin, async (req, res) => {
-  const page = Math.max(1, Number(req.query?.page || 1));
-  const pageSize = Math.min(100, Math.max(1, Number(req.query?.pageSize || 20)));
-  const q = String(req.query?.q || "").trim();
+  const page = parsePositiveIntParam(req.query?.page, 1, MAX_PAGE);
+  const pageSize = parsePositiveIntParam(req.query?.pageSize, 20, 100);
+  const q = String(req.query?.q || "").trim().slice(0, 200);
   const status = req.query?.status ? String(req.query.status).trim() : undefined;
   const role = req.query?.role ? String(req.query.role).trim() : undefined;
   const orderBy = resolveAdminUserOrder(req.query?.sortBy, req.query?.sortDirection);
@@ -350,7 +351,7 @@ router.get("/api/admin/users", requireAuth, requireCareerAdmin, async (req, res)
     filters.push(
       `(u.email ILIKE $${idx} OR u.first_name ILIKE $${idx} OR u.last_name ILIKE $${idx} OR COALESCE(u.student_id, '') ILIKE $${idx} OR COALESCE(c.name, '') ILIKE $${idx})`,
     );
-    params.push(`%${q}%`);
+    params.push(`%${escapeLikePattern(q)}%`);
   }
 
   if (status) {

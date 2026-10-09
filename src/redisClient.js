@@ -6,7 +6,7 @@ let client;
 
 export const connectRedis = async () => {
 
-  console.log("Connecting to Redis at", redisURL);
+  console.log("Connecting to Redis at", redisURL.replace(/\/\/[^@/]*@/u, "//***@"));
   
 
   client = createClient({ url: redisURL });

@@ -1,6 +1,7 @@
 import { DEFAULT_ORG_ID } from "../config/appConfig.js";
 import { withTransaction } from "../postgresClient.js";
 import { assertTargetCareerAccess } from "./adminUserCareerScope.js";
+import { capHoursToGoal, goalCapNote, loadUserHoursProgress } from "./afcHoursGoal.js";
 
 const ACCOUNT_NUMBER_PATTERN = /^\d{8,10}$/u;
 const HOURS_PATTERN = /^\d{1,3}(?:\.\d{1,2})?$/u;
@@ -146,6 +147,10 @@ export async function addManualAccountHours(
       );
     }
 
+    const progress = await loadUserHoursProgress(tx, target.id);
+    const creditedHours = capHoursToGoal(normalizedHours, progress.total, progress.goal);
+    const ledgerNote = `${normalizedMotive}${goalCapNote(creditedHours, normalizedHours, progress.goal)}`;
+
     const insertResult = await tx.query(
       `INSERT INTO hours_ledger (
          user_id,
@@ -161,7 +166,7 @@ export async function addManualAccountHours(
        VALUES ($1, NULL, $2, 'adjustment'::ledger_reason, NULL, $3, $4, $5, $6::uuid)
       ON CONFLICT (request_id) WHERE request_id IS NOT NULL DO NOTHING
        RETURNING id, user_id, hours_delta, reason::text AS reason, note, category, created_at, request_id`,
-      [target.id, normalizedHours, admin.userId, normalizedMotive, normalizedCategory, normalizedRequestId],
+      [target.id, creditedHours, admin.userId, ledgerNote, normalizedCategory, normalizedRequestId],
     );
 
     let entry = insertResult.rows?.[0] ?? null;
@@ -178,13 +183,14 @@ export async function addManualAccountHours(
       );
       entry = existingResult.rows?.[0] ?? null;
 
+      // En un reintento el saldo pudo cambiar; la nota y las horas pueden reflejar el tope de la meta.
       if (
         !entry ||
         String(entry.user_id) !== String(target.id) ||
         String(entry.created_by) !== String(admin.userId) ||
-        Number(entry.hours_delta) !== normalizedHours ||
+        Number(entry.hours_delta) > normalizedHours ||
         entry.category !== normalizedCategory ||
-        entry.note !== normalizedMotive
+        !(entry.note === normalizedMotive || String(entry.note || "").startsWith(`${normalizedMotive} · meta AFC`))
       ) {
         throw new ManualHoursAdjustmentError(
           409,
@@ -205,6 +211,8 @@ export async function addManualAccountHours(
       created,
       account_number: normalizedAccountNumber,
       hours_added: Number(entry.hours_delta),
+      hours_requested: normalizedHours,
+      hours_goal: progress.goal,
       total_hours: Number(balanceResult.rows?.[0]?.total_hours ?? 0),
       entry: {
         id: entry.id,

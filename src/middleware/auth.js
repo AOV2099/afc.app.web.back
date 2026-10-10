@@ -22,6 +22,33 @@ export function buildRequestAuth(sessionId, session) {
     role: session.role,
     careerId: session.careerId ?? null,
     picture: typeof session.picture === "string" ? session.picture : null,
+    viewAs: session.viewAs
+      ? {
+          adminUserId: session.viewAs.adminUserId,
+          startedAt: session.viewAs.startedAt,
+          expiresAt: session.viewAs.expiresAt,
+        }
+      : null,
+  };
+}
+
+export const VIEW_AS_EXIT_PATH = "/api/view-as/exit";
+const VIEW_AS_WRITABLE_PATHS = new Set([VIEW_AS_EXIT_PATH, "/api/logout"]);
+const READ_ONLY_METHODS = new Set(["GET", "HEAD", "OPTIONS"]);
+
+export function isViewAsRequestAllowed(method, path) {
+  return READ_ONLY_METHODS.has(String(method || "").toUpperCase()) || VIEW_AS_WRITABLE_PATHS.has(path);
+}
+
+/** Sesión original del superadmin guardada al iniciar "Ver como usuario". */
+export function restoreViewAsSession(session) {
+  const { viewAs, ...rest } = session;
+  return {
+    ...rest,
+    userId: viewAs.adminUserId,
+    role: viewAs.adminRole,
+    careerId: viewAs.adminCareerId ?? null,
+    picture: viewAs.adminPicture ?? null,
   };
 }
 
@@ -47,6 +74,25 @@ async function loadCurrentUser(userId) {
   return result.rows?.[0] ?? null;
 }
 
+// Devuelve la sesión vigente, la del superadmin si la vista caducó o el usuario visto cambió,
+// o null si la sesión debe revocarse.
+async function resolveSession(redis, sessionId, session) {
+  if (!session.viewAs) {
+    return isSessionStillValid(session, await loadCurrentUser(session.userId)) ? session : null;
+  }
+
+  const adminSession = restoreViewAsSession(session);
+  const admin = await loadCurrentUser(adminSession.userId);
+  if (!isSessionStillValid(adminSession, admin) || !isGlobalCareerAdmin(adminSession)) return null;
+
+  const expired = Date.now() >= Number(session.viewAs.expiresAt);
+  if (expired || !isSessionStillValid(session, await loadCurrentUser(session.userId))) {
+    await redis.set(sessionKey(sessionId), JSON.stringify(adminSession), { KEEPTTL: true });
+    return adminSession;
+  }
+  return session;
+}
+
 export async function requireAuth(req, res, next) {
   try {
     const redis = getRedisClient();
@@ -64,12 +110,13 @@ export async function requireAuth(req, res, next) {
       return res.status(401).json({ ok: false, message: "Sesión expirada." });
     }
 
-    const session = JSON.parse(raw);
-    if (!session?.userId) {
+    const parsed = JSON.parse(raw);
+    if (!parsed?.userId) {
       return res.status(401).json({ ok: false, message: "Sesión inválida." });
     }
 
-    if (!isSessionStillValid(session, await loadCurrentUser(session.userId))) {
+    const session = await resolveSession(redis, sessionId, parsed);
+    if (!session) {
       await redis.del(sessionKey(sessionId));
       return res.status(401).json({
         ok: false,
@@ -79,6 +126,15 @@ export async function requireAuth(req, res, next) {
     }
 
     req.auth = buildRequestAuth(sessionId, session);
+
+    const requestPath = String(req.originalUrl || req.url || "").split("?")[0];
+    if (req.auth.viewAs && !isViewAsRequestAllowed(req.method, requestPath)) {
+      return res.status(403).json({
+        ok: false,
+        code: "view_as_read_only",
+        message: "Estás en «Ver como usuario» (solo lectura). Sal de esta vista para hacer cambios.",
+      });
+    }
 
     return next();
   } catch (err) {

@@ -500,7 +500,16 @@ router.get("/api/me", requireAuth, async (req, res) => {
 
   return res.status(200).json({
     ok: true,
-    user: authenticatedUserPayload(userRow, req.auth.picture),
+    user: {
+      ...authenticatedUserPayload(userRow, req.auth.picture),
+      view_as: req.auth.viewAs
+        ? {
+            read_only: true,
+            started_at: new Date(req.auth.viewAs.startedAt).toISOString(),
+            expires_at: new Date(req.auth.viewAs.expiresAt).toISOString(),
+          }
+        : null,
+    },
   });
 });
 

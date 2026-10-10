@@ -20,6 +20,7 @@ import afcCatalogRoutes from "./src/routes/afcCatalogRoutes.js";
 import filesRoutes from "./src/routes/filesRoutes.js";
 import careersRoutes from "./src/routes/careersRoutes.js";
 import alertsRoutes from "./src/routes/alertsRoutes.js";
+import viewAsRoutes from "./src/routes/viewAsRoutes.js";
 import {
   EVENT_TIME_ZONE,
   startEventFinalizationScheduler,
@@ -76,6 +77,7 @@ app.use(afcCatalogRoutes);
 app.use(filesRoutes);
 app.use(careersRoutes);
 app.use(alertsRoutes);
+app.use(viewAsRoutes);
 
 app.use((req, res) => {
   res.status(404).json({ ok: false, message: "Recurso no encontrado." });

@@ -33,6 +33,75 @@ export function assertAdminRoleAssignmentAccess(auth, roleValue) {
   );
 }
 
+// Áreas (no carreras) cuyos admins pueden dar de alta alumnos y visitantes, además de staff.
+const USER_PROVISIONING_CAREER_NAMES = new Set(["deportivas", "culturales"]);
+const ALL_ROLES = [ROLES.ADMIN, ROLES.STAFF, ROLES.STUDENT, ROLES.AUDITOR, ROLES.VISITOR];
+const PROVISIONING_AREA_ROLES = [ROLES.STAFF, ROLES.STUDENT, ROLES.VISITOR];
+const SCOPED_ADMIN_ROLES = [ROLES.STAFF];
+export const PASSWORD_MANAGED_ROLES = new Set([ROLES.VISITOR, ROLES.STAFF]);
+
+export function normalizeCareerName(name) {
+  return String(name || "")
+    .normalize("NFD")
+    .replace(/[\u0300-\u036f]/gu, "")
+    .trim()
+    .toLowerCase();
+}
+
+export function isUserProvisioningCareer(careerName) {
+  return USER_PROVISIONING_CAREER_NAMES.has(normalizeCareerName(careerName));
+}
+
+export function getAssignableUserRoles(auth, adminCareerName) {
+  if (auth?.role !== ROLES.ADMIN) return [];
+  if (isGlobalCareerAdmin(auth)) return [...ALL_ROLES];
+  return isUserProvisioningCareer(adminCareerName) ? [...PROVISIONING_AREA_ROLES] : [...SCOPED_ADMIN_ROLES];
+}
+
+export function canImportStudents(auth, adminCareerName) {
+  if (auth?.role !== ROLES.ADMIN) return false;
+  return isGlobalCareerAdmin(auth) || isUserProvisioningCareer(adminCareerName);
+}
+
+export function assertUserRoleAssignmentAccess(auth, roleValue, adminCareerName) {
+  const role = String(roleValue || "").trim().toLowerCase();
+  if (getAssignableUserRoles(auth, adminCareerName).includes(role)) return;
+
+  const onlyStaff = !isGlobalCareerAdmin(auth) && !isUserProvisioningCareer(adminCareerName);
+  throw new AdminUserCareerScopeError(
+    403,
+    "role_assignment_forbidden",
+    onlyStaff
+      ? "Solo puedes crear o asignar usuarios staff."
+      : "Solo puedes crear o asignar alumnos, visitantes o staff.",
+  );
+}
+
+export function assertStudentImportAccess(auth, adminCareerName) {
+  if (canImportStudents(auth, adminCareerName)) return;
+  throw new AdminUserCareerScopeError(
+    403,
+    "student_import_forbidden",
+    "Solo el administrador global, Deportivas y Culturales pueden importar estudiantes.",
+  );
+}
+
+export function assertPasswordChangeAllowed(targetRole) {
+  if (PASSWORD_MANAGED_ROLES.has(String(targetRole || "").trim().toLowerCase())) return;
+  throw new AdminUserCareerScopeError(
+    403,
+    "password_change_forbidden",
+    "Solo se puede cambiar la contraseña de visitantes y staff.",
+  );
+}
+
+export async function loadAdminCareerName(db, auth) {
+  const careerId = normalizeCareerId(auth?.careerId);
+  if (careerId === null) return null;
+  const result = await db.query(`SELECT name FROM careers WHERE id = $1 LIMIT 1`, [careerId]);
+  return result.rows?.[0]?.name ?? null;
+}
+
 export function getScopedAdminCareerId(auth) {
   if (auth?.role !== ROLES.ADMIN) return null;
   const careerId = normalizeCareerId(auth?.careerId);

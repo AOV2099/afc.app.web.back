@@ -456,7 +456,7 @@ export async function commitBulkHoursImport({ importId, importer, dependencies =
           row.userId,
           credited,
           token.importerUserId,
-          `${row.motive}${goalCapNote(credited, row.hours, goal)}`,
+          `${row.motive}${goalCapNote(credited, row.hours)}`,
           token.category,
           row.requestId,
         ],

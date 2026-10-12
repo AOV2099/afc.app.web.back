@@ -28,9 +28,13 @@ import {
 } from "../services/manualHoursAdjustmentService.js";
 import {
   assertAdminRoleAssignmentAccess,
+  assertPasswordChangeAllowed,
   assertRequestedCareerAccess,
+  assertStudentImportAccess,
+  assertUserRoleAssignmentAccess,
   buildAdminCareerFilter,
   getScopedAdminCareerId,
+  loadAdminCareerName,
   lockAdminUserTarget,
   normalizeCareerId,
   resolveAdminUserListCareerFilter,
@@ -117,6 +121,25 @@ function sendScopeError(res, error) {
   });
 }
 
+async function requireStudentImportAccess(req, res, next) {
+  try {
+    assertStudentImportAccess(req.auth, await loadAdminCareerName({ query }, req.auth));
+    return next();
+  } catch (error) {
+    if (error?.statusCode === 403) return sendScopeError(res, error);
+    console.error("Error validando permiso de importación:", error?.message);
+    return res.status(500).json({ ok: false, message: "No se pudo validar el permiso." });
+  }
+}
+
+async function loadMembershipRole(db, userId) {
+  const result = await db.query(
+    `SELECT role::text AS role FROM memberships WHERE org_id = $1 AND user_id = $2 LIMIT 1`,
+    [DEFAULT_ORG_ID, userId],
+  );
+  return result.rows?.[0]?.role ?? null;
+}
+
 function parseStudentCsvBody(req, res, next) {
   if (!req.is("text/csv")) {
     return res.status(415).json({
@@ -191,6 +214,7 @@ router.post(
   "/api/admin/users/import/preview",
   requireAuth,
   requireCareerAdmin,
+  requireStudentImportAccess,
   limitStudentImportPreview,
   parseStudentCsvBody,
   async (req, res) => {
@@ -211,6 +235,7 @@ router.post(
   "/api/admin/users/import/:importId/commit",
   requireAuth,
   requireCareerAdmin,
+  requireStudentImportAccess,
   limitStudentImportCommit,
   async (req, res) => {
     try {
@@ -527,8 +552,13 @@ router.post("/api/admin/users", requireAuth, requireCareerAdmin, async (req, res
 
   try {
     assertAdminRoleAssignmentAccess(req.auth, role);
+    assertUserRoleAssignmentAccess(req.auth, role, await loadAdminCareerName({ query }, req.auth));
     careerId = resolveEffectiveCreateCareer(req.auth, careerInput);
   } catch (error) {
+    if (!error?.statusCode) {
+      console.error("Error validando alta de usuario:", error?.message);
+      return res.status(500).json({ ok: false, message: "No se pudo crear el usuario." });
+    }
     return sendScopeError(res, error);
   }
 
@@ -700,11 +730,15 @@ router.put("/api/admin/users/:userId", requireAuth, requireCareerAdmin, async (r
 
   try {
     assertAdminRoleAssignmentAccess(req.auth, role);
+    const adminCareerName = role !== undefined ? await loadAdminCareerName({ query }, req.auth) : null;
     const finalUser = await withTransaction(async (tx) => {
       const targetUser = await lockAdminUserTarget(tx, req.auth, userId, {
         includeAttributes: true,
       });
       assertRequestedCareerAccess(req.auth, careerInput);
+      if (role !== undefined && role !== (await loadMembershipRole(tx, userId))) {
+        assertUserRoleAssignmentAccess(req.auth, role, adminCareerName);
+      }
 
       const attributes = targetUser.attributes ?? null;
       if (attributes && attributes.event_staff === true) {
@@ -849,6 +883,7 @@ router.patch(
     try {
       await withTransaction(async (tx) => {
         await lockAdminUserTarget(tx, req.auth, userId);
+        assertPasswordChangeAllowed(await loadMembershipRole(tx, userId));
         const passwordHash = await bcrypt.hash(nextPassword, 12);
         await tx.query(
           `UPDATE users

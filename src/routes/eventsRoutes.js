@@ -5,6 +5,8 @@ import bcrypt from "bcryptjs";
 import { query, withTransaction } from "../postgresClient.js";
 import { getRedisClient } from "../redisClient.js";
 import {
+  isGlobalCareerAdmin,
+  normalizeCareerId,
   requireAdmin,
   requireAuth,
   requireCheckinScanner,
@@ -846,7 +848,26 @@ async function getTimelineFromRedis({ eventId, type, from, to, limit }) {
     .filter(Boolean);
 }
 
-export function buildEventConditions({ q, status, category, startsFrom, startsTo, endsFrom, forcePublished }) {
+export const CLOSED_EVENT_STATUSES = ["ended", "cancelled"];
+
+export function parseEventStatusesParam(value) {
+  const raw = Array.isArray(value) ? value : value === undefined || value === null ? [] : [value];
+  const statuses = [...new Set(raw.flatMap((item) => String(item).split(",")).map((item) => item.trim()).filter(Boolean))];
+  const invalid = statuses.find((item) => !EVENT_STATUSES.has(item));
+  return invalid ? { error: "status inválido." } : { statuses };
+}
+
+export function buildEventConditions({
+  q,
+  status,
+  statuses,
+  category,
+  startsFrom,
+  startsTo,
+  endsFrom,
+  forcePublished,
+  hideClosedFromOtherCareersOf = null,
+}) {
   const conditions = [];
   const params = [];
 
@@ -854,10 +875,24 @@ export function buildEventConditions({ q, status, category, startsFrom, startsTo
     const idx = params.length + 1;
     conditions.push(`e.status = $${idx}::event_status`);
     params.push("published");
+  } else if (Array.isArray(statuses) && statuses.length > 0) {
+    const idx = params.length + 1;
+    conditions.push(`e.status::text = ANY($${idx}::text[])`);
+    params.push(statuses);
   } else if (status) {
     const idx = params.length + 1;
     conditions.push(`e.status = $${idx}::event_status`);
     params.push(status);
+  }
+
+  if (hideClosedFromOtherCareersOf !== null) {
+    const statusIdx = params.length + 1;
+    const careerIdx = params.length + 2;
+    conditions.push(
+      `(e.status::text <> ALL($${statusIdx}::text[])
+        OR EXISTS (SELECT 1 FROM users ou WHERE ou.id = e.created_by AND ou.career_id = $${careerIdx}))`,
+    );
+    params.push(CLOSED_EVENT_STATUSES, hideClosedFromOtherCareersOf);
   }
 
   if (q) {
@@ -911,11 +946,13 @@ async function listEvents({
   res,
   q,
   status,
+  statuses,
   category,
   startsFrom,
   startsTo,
   endsFrom,
   forcePublished,
+  hideClosedFromOtherCareersOf = null,
   includeStaff = false,
 }) {
   const pageRaw = res.req.query?.page ?? 1;
@@ -934,11 +971,13 @@ async function listEvents({
   const { conditions, params } = buildEventConditions({
     q,
     status,
+    statuses,
     category,
     startsFrom,
     startsTo,
     endsFrom,
     forcePublished,
+    hideClosedFromOtherCareersOf,
   });
 
   const shiftedConditionsSql = buildEventWhereSql(conditions, 2);
@@ -2022,13 +2061,13 @@ router.get("/api/me/hours/history", requireAuth, async (req, res) => {
 
 router.get("/api/admin/events", requireAuth, requireEventManager, async (req, res) => {
   const q = String(req.query?.q || "").trim().slice(0, 200);
-  const status = req.query?.status ? String(req.query.status).trim() : undefined;
+  const parsedStatuses = parseEventStatusesParam(req.query?.status);
   const category = req.query?.category ? String(req.query.category).trim() : undefined;
   const startsFrom = req.query?.starts_from ? parseIsoDateOrNull(req.query.starts_from) : null;
   const startsTo = req.query?.starts_to ? parseIsoDateOrNull(req.query.starts_to) : null;
 
-  if (status && !EVENT_STATUSES.has(status)) {
-    return res.status(400).json({ ok: false, message: "status inválido." });
+  if (parsedStatuses.error) {
+    return res.status(400).json({ ok: false, message: parsedStatuses.error });
   }
   if (req.query?.starts_from && !startsFrom) {
     return res.status(400).json({ ok: false, message: "starts_from inválido." });
@@ -2041,11 +2080,13 @@ router.get("/api/admin/events", requireAuth, requireEventManager, async (req, re
     const result = await listEvents({
       res,
       q,
-      status,
+      statuses: parsedStatuses.statuses,
       category,
       startsFrom,
       startsTo,
       forcePublished: false,
+      // Los eventos finalizados o cancelados de otras áreas no le competen al admin de carrera.
+      hideClosedFromOtherCareersOf: isGlobalCareerAdmin(req.auth) ? null : normalizeCareerId(req.auth.careerId),
       includeStaff: true,
     });
 
@@ -3213,7 +3254,7 @@ router.post(
             progress.total,
             progress.goal,
           );
-          const capNote = goalCapNote(creditedHours, grantedHours, progress.goal);
+          const capNote = goalCapNote(creditedHours, grantedHours);
 
           await tx.query(
             `INSERT INTO hours_ledger (

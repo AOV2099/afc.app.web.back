@@ -22,6 +22,11 @@ import {
   ROLES,
 } from "../config/appConfig.js";
 import { requireAuth } from "../middleware/auth.js";
+import {
+  canImportStudents,
+  getAssignableUserRoles,
+  PASSWORD_MANAGED_ROLES,
+} from "../services/adminUserCareerScope.js";
 import { createOAuthRateLimit } from "../middleware/oauthRateLimit.js";
 import { safeUserPayload, sessionKey } from "../utils/session.js";
 import {
@@ -502,6 +507,14 @@ router.get("/api/me", requireAuth, async (req, res) => {
     ok: true,
     user: {
       ...authenticatedUserPayload(userRow, req.auth.picture),
+      user_admin:
+        req.auth.role === ROLES.ADMIN
+          ? {
+              creatable_roles: getAssignableUserRoles(req.auth, userRow.career_name),
+              can_import_students: canImportStudents(req.auth, userRow.career_name),
+              password_roles: [...PASSWORD_MANAGED_ROLES],
+            }
+          : null,
       view_as: req.auth.viewAs
         ? {
             read_only: true,

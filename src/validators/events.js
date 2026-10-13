@@ -40,6 +40,32 @@ function parseBooleanInput(value, defaultValue = false) {
   return Boolean(value);
 }
 
+function isBlankInput(value) {
+  return value === undefined || value === null || String(value).trim() === "";
+}
+
+export const PUBLISH_REQUIRED_FIELDS = [
+  ["title", "título"],
+  ["description", "descripción"],
+  ["starts_at", "fecha y hora de inicio"],
+  ["ends_at", "fecha y hora de fin"],
+  ["location", "ubicación"],
+  ["organizer", "organizador"],
+];
+
+// Campos sin los que un evento no puede publicarse; hours_value solo se revisa si viene en el objeto.
+export function missingPublishFields(event) {
+  const missing = PUBLISH_REQUIRED_FIELDS.filter(([key]) => isBlankInput(event?.[key])).map(([, label]) => label);
+  if (event && Object.hasOwn(event, "hours_value") && (event.hours_value === null || event.hours_value === undefined)) {
+    missing.push("horas AFC");
+  }
+  return missing;
+}
+
+export function publishMissingMessage(missing) {
+  return `Para publicar el evento falta: ${missing.join(", ")}. Guárdalo como borrador mientras tanto.`;
+}
+
 export function normalizeCreateEventPayload(body) {
   const title = String(body?.title || "").trim();
   const description =
@@ -60,6 +86,12 @@ export function normalizeCreateEventPayload(body) {
       : String(coverImageUrlInput || "").trim() || null;
   const startsAt = parseIsoDateOrNull(body?.starts_at);
   const endsAt = parseIsoDateOrNull(body?.ends_at);
+  if (!isBlankInput(body?.starts_at) && !startsAt) {
+    return { error: "La fecha y hora de inicio no son válidas." };
+  }
+  if (!isBlankInput(body?.ends_at) && !endsAt) {
+    return { error: "La fecha y hora de fin no son válidas." };
+  }
 
   let afc = null;
   if (body?.afc_valuation !== undefined && body?.afc_valuation !== null) {
@@ -69,8 +101,9 @@ export function normalizeCreateEventPayload(body) {
   }
 
   // Con valoración AFC las horas se calculan con el catálogo de la BD en la ruta (prepareEventHoursValuation);
-  // se ignora hours_value del cliente.
-  const hoursValue = afc
+  // se ignora hours_value del cliente. hours_value: null deja las horas pendientes (solo en borrador).
+  const hoursPending = !afc && body?.hours_value === null;
+  const hoursValue = afc || hoursPending
     ? null
     : body?.hours_value === undefined
       ? 0
@@ -82,7 +115,7 @@ export function normalizeCreateEventPayload(body) {
     capacityRaw === undefined || capacityRaw === null || capacityRaw === ""
       ? null
       : Number(capacityRaw);
-  const category = String(body?.category || "").trim();
+  const category = String(body?.category || "").trim() || "general";
   const status = body?.status === undefined ? "draft" : String(body.status).trim();
   const registrationMode =
     body?.registration_mode === undefined ? "auto" : String(body.registration_mode).trim();
@@ -104,13 +137,28 @@ export function normalizeCreateEventPayload(body) {
   const attributes = body?.attributes === undefined ? {} : body.attributes;
 
   if (!title) return { error: "El título del evento es obligatorio." };
-  if (!startsAt) return { error: "La fecha y hora de inicio son obligatorias y deben ser válidas." };
-  if (!endsAt) return { error: "La fecha y hora de fin son obligatorias y deben ser válidas." };
+  if (!description) return { error: "La descripción del evento es obligatoria." };
+  if (!EVENT_STATUSES.has(status)) return { error: "El estatus seleccionado no es válido." };
+  if (!HOURS_PENDING_ALLOWED_STATUSES.has(status)) {
+    const missing = missingPublishFields({
+      title,
+      description,
+      starts_at: startsAt,
+      ends_at: endsAt,
+      location,
+      organizer: organizer || attributes?.organizer,
+      ...(afc ? {} : { hours_value: hoursValue }),
+    });
+    if (missing.length) return { error: publishMissingMessage(missing) };
+  }
+  if (Boolean(startsAt) !== Boolean(endsAt)) {
+    return { error: "Captura la fecha y hora de inicio y también las de fin." };
+  }
   const now = new Date();
-  if (startsAt < now) return { error: "La fecha y hora de inicio no pueden estar en el pasado." };
-  if (endsAt < now) return { error: "La fecha y hora de fin no pueden estar en el pasado." };
-  if (endsAt <= startsAt) return { error: "La fecha y hora de fin deben ser posteriores al inicio." };
-  if (!afc && (hoursValue === null || hoursValue < 0 || hoursValue > MAX_EVENT_HOURS)) {
+  if (startsAt && startsAt < now) return { error: "La fecha y hora de inicio no pueden estar en el pasado." };
+  if (endsAt && endsAt < now) return { error: "La fecha y hora de fin no pueden estar en el pasado." };
+  if (startsAt && endsAt <= startsAt) return { error: "La fecha y hora de fin deben ser posteriores al inicio." };
+  if (!afc && !hoursPending && (hoursValue === null || hoursValue < 0 || hoursValue > MAX_EVENT_HOURS)) {
     return {
       error: `Las horas acreditables deben ser un decimal entre 0 y ${MAX_EVENT_HOURS}, sin letras ni notación científica.`,
     };
@@ -123,7 +171,6 @@ export function normalizeCreateEventPayload(body) {
     return { error: "El cupo debe ser un número entero válido." };
   }
   if (!category) return { error: "La categoría es obligatoria." };
-  if (!EVENT_STATUSES.has(status)) return { error: "El estatus seleccionado no es válido." };
   if (!afc && hoursValue === null && !HOURS_PENDING_ALLOWED_STATUSES.has(status)) {
     return {
       error:
@@ -135,7 +182,7 @@ export function normalizeCreateEventPayload(body) {
     return { error: "La política de reenvío seleccionada no es válida." };
   }
   if (!CANCEL_POLICIES.has(cancelPolicy)) return { error: "La política de cancelación seleccionada no es válida." };
-  if (cancelDeadline && cancelDeadline > startsAt) {
+  if (cancelDeadline && startsAt && cancelDeadline > startsAt) {
     return { error: "La fecha límite de cancelación no puede ser posterior al inicio del evento." };
   }
   if (attributes === null || typeof attributes !== "object" || Array.isArray(attributes)) {
@@ -191,7 +238,12 @@ export function normalizeCreateEventPayload(body) {
   }
 
   let sessions = [];
-  if (body?.sessions === undefined) {
+  if (!startsAt) {
+    // Borrador sin fechas: las sesiones se crean al capturar las fechas.
+    if (Array.isArray(body?.sessions) && body.sessions.length > 0) {
+      return { error: "Captura las fechas del evento antes de agregar sesiones." };
+    }
+  } else if (body?.sessions === undefined) {
     sessions = [
       {
         starts_at: startsAt,

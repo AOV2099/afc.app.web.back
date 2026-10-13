@@ -24,9 +24,12 @@ import {
 } from "../config/appConfig.js";
 import {
   MAX_EVENT_HOURS,
+  missingPublishFields,
   normalizeCreateEventPayload,
   parseIsoDateOrNull,
   parsePlainDecimalOrNull,
+  PUBLISH_REQUIRED_FIELDS,
+  publishMissingMessage,
 } from "../validators/events.js";
 import {
   assertEventStaffCareer,
@@ -889,7 +892,7 @@ export function buildEventConditions({
     const statusIdx = params.length + 1;
     const careerIdx = params.length + 2;
     conditions.push(
-      `(e.status::text <> ALL($${statusIdx}::text[])
+      `((e.status::text <> ALL($${statusIdx}::text[]) AND (e.ends_at IS NULL OR e.ends_at >= now()))
         OR EXISTS (SELECT 1 FROM users ou WHERE ou.id = e.created_by AND ou.career_id = $${careerIdx}))`,
     );
     params.push(CLOSED_EVENT_STATUSES, hideClosedFromOtherCareersOf);
@@ -2085,7 +2088,7 @@ router.get("/api/admin/events", requireAuth, requireEventManager, async (req, re
       startsFrom,
       startsTo,
       forcePublished: false,
-      // Los eventos finalizados o cancelados de otras áreas no le competen al admin de carrera.
+      // Los eventos pasados, finalizados o cancelados de otras áreas no le competen al admin de carrera.
       hideClosedFromOtherCareersOf: isGlobalCareerAdmin(req.auth) ? null : normalizeCareerId(req.auth.careerId),
       includeStaff: true,
     });
@@ -3443,7 +3446,7 @@ async function createEventRecords(tx, eventInput, rawBody, authUserId, managerCa
   }
 
   let staffUser = null;
-  let staffPassword = null;
+  // En la carga masiva el staff no se crea automáticamente; se asigna después desde el evento.
   if (assignStaff && staffUserId !== null) {
     if (!Number.isInteger(staffUserId) || staffUserId <= 0) {
       throw createHttpError(400, "El usuario staff seleccionado no es válido.");
@@ -3459,36 +3462,11 @@ async function createEventRecords(tx, eventInput, rawBody, authUserId, managerCa
     staffUser = staffResult.rows?.[0] ?? null;
     if (!staffUser) throw createHttpError(400, "El usuario staff seleccionado no existe.");
     assertEventStaffCareer(managerCareerId, staffUser.career_id);
-  } else {
-    const staffEmail = generateStaffEmail(eventRow.id);
-    const rawPassword = generateStaffPassword();
-    const passwordHash = await bcrypt.hash(rawPassword, 12);
-    try {
-      const staffInsertResult = await tx.query(
-        `INSERT INTO users (email, password_hash, first_name, last_name, status, career_id, attributes)
-         VALUES ($1, $2, $3, $4, 'active', $5, $6::jsonb)
-         RETURNING id, email, career_id`,
-        [staffEmail, passwordHash, "Staff", `Evento ${eventRow.id}`, managerCareerId, JSON.stringify({ event_id: eventRow.id, event_staff: true })],
-      );
-      staffUser = staffInsertResult.rows[0];
-      staffPassword = rawPassword;
-      await tx.query(
-        `INSERT INTO memberships (org_id, user_id, role)
-         VALUES ($1, $2, $3::membership_role)
-         ON CONFLICT (org_id, user_id) DO UPDATE SET role = EXCLUDED.role`,
-        [DEFAULT_ORG_ID, staffUser.id, ROLES.STAFF],
-      );
-    } catch (err) {
-      if (err?.code === "23505") {
-        throw createHttpError(409, "Ya existe un usuario staff para este evento.");
-      }
-      throw err;
-    }
-  }
 
-  const nextAttributes = { ...(eventInput.attributes || {}), staff_user_id: staffUser.id };
-  await tx.query(`UPDATE events SET attributes = $1::jsonb WHERE id = $2`, [JSON.stringify(nextAttributes), eventRow.id]);
-  eventRow.attributes = nextAttributes;
+    const nextAttributes = { ...(eventInput.attributes || {}), staff_user_id: staffUser.id };
+    await tx.query(`UPDATE events SET attributes = $1::jsonb WHERE id = $2`, [JSON.stringify(nextAttributes), eventRow.id]);
+    eventRow.attributes = nextAttributes;
+  }
 
   let geofenceRow = null;
   if (eventInput.geo_enforced && eventInput.geo) {
@@ -3515,7 +3493,6 @@ async function createEventRecords(tx, eventInput, rawBody, authUserId, managerCa
     sessions: createdSessions,
     geofence: geofenceRow,
     staff_user: staffUser,
-    staff_password: staffPassword,
   };
 }
 
@@ -3579,11 +3556,6 @@ router.post("/api/admin/events/bulk", requireAuth, requireEventManager, async (r
       success: true,
       message: `${created.length} eventos creados correctamente.`,
       events: created.map((item) => mapEventForResponse(item.event)),
-      staff_credentials: created.map((item) => ({
-        event_id: item.event.id,
-        email: item.staff_user?.email ?? null,
-        password: item.staff_password ?? null,
-      })),
     });
   } catch (err) {
     const statusCode = [400, 403, 409].includes(err?.statusCode) ? err.statusCode : 500;
@@ -3985,28 +3957,29 @@ router.put("/api/admin/events/:eventId", requireAuth, requireAdmin, async (req, 
         assertAttendanceLockedFields(existingEvent, updates);
       }
 
-      const startsAt =
-        updates.starts_at !== undefined
-          ? parseIsoDateOrNull(updates.starts_at)
-          : new Date(existingEvent.starts_at);
-      const endsAt =
-        updates.ends_at !== undefined
-          ? parseIsoDateOrNull(updates.ends_at)
-          : new Date(existingEvent.ends_at);
+      const readDateUpdate = (field) => {
+        if (updates[field] === undefined) {
+          return existingEvent[field] ? new Date(existingEvent[field]) : null;
+        }
+        if (updates[field] === null || String(updates[field]).trim() === "") return null;
+        const parsed = parseIsoDateOrNull(updates[field]);
+        if (!parsed) throw createHttpError(400, "starts_at y ends_at deben ser fechas ISO válidas.");
+        return parsed;
+      };
+      const startsAt = readDateUpdate("starts_at");
+      const endsAt = readDateUpdate("ends_at");
 
-      if (!startsAt || !endsAt) {
-        const validationError = new Error("starts_at y ends_at deben ser fechas ISO válidas.");
-        validationError.statusCode = 400;
-        throw validationError;
+      if (Boolean(startsAt) !== Boolean(endsAt)) {
+        throw createHttpError(400, "Captura la fecha y hora de inicio y también las de fin.");
       }
       const now = new Date();
-      if (updates.starts_at !== undefined && startsAt < now) {
+      if (updates.starts_at !== undefined && startsAt && startsAt < now) {
         throw createHttpError(400, "La fecha y hora de inicio no pueden estar en el pasado.");
       }
-      if (updates.ends_at !== undefined && endsAt < now) {
+      if (updates.ends_at !== undefined && endsAt && endsAt < now) {
         throw createHttpError(400, "La fecha y hora de fin no pueden estar en el pasado.");
       }
-      if (endsAt <= startsAt) {
+      if (startsAt && endsAt <= startsAt) {
         const validationError = new Error("La fecha y hora de fin deben ser posteriores al inicio.");
         validationError.statusCode = 400;
         throw validationError;
@@ -4108,7 +4081,6 @@ router.put("/api/admin/events/:eventId", requireAuth, requireAdmin, async (req, 
         validationError.statusCode = 400;
         throw validationError;
       }
-      assertHoursAllowStatus(hoursValue, status);
 
       const registrationMode =
         updates.registration_mode !== undefined
@@ -4152,7 +4124,7 @@ router.put("/api/admin/events/:eventId", requireAuth, requireAdmin, async (req, 
         validationError.statusCode = 400;
         throw validationError;
       }
-      if (cancelDeadline && new Date(cancelDeadline) > startsAt) {
+      if (cancelDeadline && startsAt && new Date(cancelDeadline) > startsAt) {
         const validationError = new Error(
           "cancel_deadline no puede ser posterior a starts_at.",
         );
@@ -4282,6 +4254,38 @@ router.put("/api/admin/events/:eventId", requireAuth, requireAdmin, async (req, 
             : String(coverImageUrlInput || "").trim() || null
           : existingEvent.cover_image_url;
 
+      const nextTitle = updates.title !== undefined ? String(updates.title || "").trim() : existingEvent.title;
+      const nextDescription =
+        updates.description !== undefined
+          ? updates.description === null
+            ? null
+            : String(updates.description || "").trim()
+          : existingEvent.description;
+      if (!nextTitle) throw createHttpError(400, "El título del evento es obligatorio.");
+      if (updates.description !== undefined && !nextDescription) {
+        throw createHttpError(400, "La descripción del evento es obligatoria.");
+      }
+      if (status === "published") {
+        const nextEvent = {
+          title: nextTitle,
+          description: nextDescription,
+          starts_at: startsAt,
+          ends_at: endsAt,
+          location,
+          organizer,
+          hours_value: hoursValue,
+        };
+        const missing = missingPublishFields(nextEvent);
+        // Los eventos ya publicados con datos históricos incompletos solo se bloquean si se vacía un campo.
+        const clearsRequired = PUBLISH_REQUIRED_FIELDS.some(
+          ([key]) => updates[key] !== undefined && (nextEvent[key] === null || String(nextEvent[key]).trim() === ""),
+        );
+        if (missing.length && (existingEvent.status !== "published" || clearsRequired)) {
+          throw createHttpError(400, publishMissingMessage(missing));
+        }
+      }
+      assertHoursAllowStatus(hoursValue, status);
+
       await tx.query(
         `UPDATE events
          SET title = $1,
@@ -4307,12 +4311,8 @@ router.put("/api/admin/events/:eventId", requireAuth, requireAdmin, async (req, 
              afc_evidence_file_id = $23
          WHERE id = $20 AND org_id = $21`,
         [
-          updates.title !== undefined ? String(updates.title || "").trim() : existingEvent.title,
-          updates.description !== undefined
-            ? updates.description === null
-              ? null
-              : String(updates.description || "").trim()
-            : existingEvent.description,
+          nextTitle,
+          nextDescription,
           category,
           location,
           organizer,
@@ -4406,7 +4406,8 @@ router.put("/api/admin/events/:eventId", requireAuth, requireAdmin, async (req, 
       }
       */
 
-      if (updates.sessions !== undefined) {
+      const sessionsDeferred = Array.isArray(updates.sessions) && updates.sessions.length === 0 && !startsAt;
+      if (updates.sessions !== undefined && !sessionsDeferred) {
         if (!Array.isArray(updates.sessions) || updates.sessions.length === 0) {
           const validationError = new Error(
             "sessions debe ser un arreglo con al menos una sesión.",
@@ -4547,7 +4548,7 @@ router.put("/api/admin/events/:eventId", requireAuth, requireAdmin, async (req, 
         [eventId],
       );
 
-      if (!sessionsResult.rows.length) {
+      if (!sessionsResult.rows.length && startsAt && endsAt) {
         const fallbackSession = await tx.query(
           `INSERT INTO event_sessions (event_id, starts_at, ends_at, label, hours_value)
            VALUES ($1, $2, $3, $4, $5)

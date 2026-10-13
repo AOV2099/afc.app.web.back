@@ -65,7 +65,5 @@ export const GOAL_CAP_NOTE_SEPARATOR = " · ";
 
 export function goalCapNote(credited, requested) {
   if (!(credited < requested)) return "";
-  return credited > 0
-    ? `${GOAL_CAP_NOTE_SEPARATOR}Se han acreditado ${credited} h`
-    : `${GOAL_CAP_NOTE_SEPARATOR}Ya se alcanzó la meta de horas AFC`;
+  return `${GOAL_CAP_NOTE_SEPARATOR}Se han agregado ${credited} hrs`;
 }

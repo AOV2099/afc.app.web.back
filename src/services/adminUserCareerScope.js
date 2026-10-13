@@ -52,6 +52,20 @@ export function isUserProvisioningCareer(careerName) {
   return USER_PROVISIONING_CAREER_NAMES.has(normalizeCareerName(careerName));
 }
 
+export const STUDY_SYSTEMS = new Set(["esc", "sua"]);
+
+// Valor ausente => null; valor inválido => undefined.
+export function normalizeStudySystem(value) {
+  if (value === undefined || value === null || String(value).trim() === "") return null;
+  const normalized = String(value).trim().toLowerCase();
+  return STUDY_SYSTEMS.has(normalized) ? normalized : undefined;
+}
+
+// Su admin puede consultar a los alumnos SUA de cualquier carrera (solo lectura).
+export function isSuaDivisionCareer(careerName) {
+  return normalizeCareerName(careerName).replace(/[^a-z]/gu, "").includes("universidadabiertacontinuayadistancia");
+}
+
 export function getAssignableUserRoles(auth, adminCareerName) {
   if (auth?.role !== ROLES.ADMIN) return [];
   if (isGlobalCareerAdmin(auth)) return [...ALL_ROLES];
@@ -139,8 +153,12 @@ export function resolveAdminUserListCareerFilter(
   requestedValue,
   parameterIndex,
   column = "u.career_id",
+  { includeSuaStudents = false } = {},
 ) {
   const adminCareerId = requireValidAdminCareer(auth);
+  const ownCareerClause = includeSuaStudents
+    ? `(${column} = $${parameterIndex} OR m.study_system = 'sua')`
+    : `${column} = $${parameterIndex}`;
   const requestedText =
     requestedValue === null || requestedValue === undefined
       ? ""
@@ -149,7 +167,7 @@ export function resolveAdminUserListCareerFilter(
   if (requestedText === "" || requestedText === "all") {
     return adminCareerId === 1
       ? { clause: "", params: [] }
-      : { clause: `${column} = $${parameterIndex}`, params: [adminCareerId] };
+      : { clause: ownCareerClause, params: [adminCareerId] };
   }
 
   if (requestedText === "none") {
@@ -181,7 +199,7 @@ export function resolveAdminUserListCareerFilter(
   }
 
   return {
-    clause: `${column} = $${parameterIndex}`,
+    clause: adminCareerId === 1 ? `${column} = $${parameterIndex}` : ownCareerClause,
     params: [adminCareerId === 1 ? requestedCareerId : adminCareerId],
   };
 }

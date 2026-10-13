@@ -1,4 +1,4 @@
-import { DEFAULT_ORG_ID } from "../config/appConfig.js";
+import { DEFAULT_ORG_ID, ROLES } from "../config/appConfig.js";
 import { withTransaction } from "../postgresClient.js";
 import { assertTargetCareerAccess } from "./adminUserCareerScope.js";
 import { capHoursToGoal, GOAL_CAP_NOTE_SEPARATOR, goalCapNote, loadUserHoursProgress } from "./afcHoursGoal.js";
@@ -129,6 +129,13 @@ export async function addManualAccountHours(
         409,
         "user_inactive",
         "No se pueden agregar horas a un usuario inactivo.",
+      );
+    }
+    if (target.role === ROLES.STAFF) {
+      throw new ManualHoursAdjustmentError(
+        409,
+        "staff_hours_not_allowed",
+        "Las cuentas staff no acumulan horas AFC.",
       );
     }
 

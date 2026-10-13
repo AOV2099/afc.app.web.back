@@ -209,7 +209,7 @@ async function loadTargets(executor, rows, { lock = false } = {}) {
   const accountNumbers = [...new Set(rows.map((row) => row.accountNumber).filter(Boolean))];
   if (accountNumbers.length === 0) return [];
   const result = await executor.query(
-    `SELECT u.id, u.student_id, u.career_id, u.status
+    `SELECT u.id, u.student_id, u.career_id, u.status, m.role::text AS role
      FROM users u
      JOIN memberships m
        ON m.user_id = u.id
@@ -244,6 +244,10 @@ function validateRowsAgainstDatabase(rows, targets, importer) {
     }
     if (target.status !== "active") {
       errors.push(csvError(row.row, "numero_cuenta", "user_inactive", "El usuario está inactivo."));
+      continue;
+    }
+    if (target.role === ROLES.STAFF) {
+      errors.push(csvError(row.row, "numero_cuenta", "staff_hours_not_allowed", "Las cuentas staff no acumulan horas AFC."));
       continue;
     }
     try {

@@ -16,7 +16,10 @@ export const STUDENT_CSV_HEADERS = Object.freeze([
   "apellidos",
   "correo",
   "numero_cuenta",
+  "sistema",
 ]);
+const STUDENT_CSV_SYSTEMS = new Set(["esc", "sua"]);
+const IMPORT_TOKEN_VERSION = 3;
 
 const CONTROL_CHARACTER_PATTERN = /[\u0000-\u001f\u007f]/u;
 const FORMULA_PREFIX_PATTERN = /^[=+\-@]/u;
@@ -232,6 +235,7 @@ export function parseAndValidateStudentCsv(
     const rawLastName = record[1] ?? "";
     const rawEmail = record[2] ?? "";
     const rawStudentId = record[3] ?? "";
+    const rawStudySystem = record[4] ?? "";
 
     validateSafeText(rawFirstName, rowNumber, "nombres", errors);
     validateSafeText(rawLastName, rowNumber, "apellidos", errors);
@@ -242,6 +246,13 @@ export function parseAndValidateStudentCsv(
     const lastName = normalizeName(rawLastName);
     const email = String(rawEmail).trim().toLowerCase();
     const studentId = String(rawStudentId).trim();
+    const studySystem = String(rawStudySystem).trim().toLowerCase();
+
+    if (!studySystem) {
+      errors.push(csvError(rowNumber, "sistema", "required", "sistema es obligatorio (ESC o SUA)."));
+    } else if (!STUDENT_CSV_SYSTEMS.has(studySystem)) {
+      errors.push(csvError(rowNumber, "sistema", "invalid_study_system", "sistema debe ser ESC o SUA."));
+    }
 
     if (!firstName) {
       errors.push(csvError(rowNumber, "nombres", "required", "nombres es obligatorio."));
@@ -299,7 +310,7 @@ export function parseAndValidateStudentCsv(
       }
     }
 
-    rows.push({ row: rowNumber, firstName, lastName, email, studentId });
+    rows.push({ row: rowNumber, firstName, lastName, email, studentId, studySystem });
   });
 
   return { rows, errors };
@@ -473,7 +484,7 @@ export async function previewBulkStudentImport({
     career_id: targetCareerId,
   };
   const tokenPayload = {
-    version: 2,
+    version: IMPORT_TOKEN_VERSION,
     importerUserId: String(importer.userId),
     targetCareerId,
     rows: parsed.rows,
@@ -496,7 +507,7 @@ function parseClaimedToken(rawToken) {
   try {
     const token = JSON.parse(rawToken);
     if (
-      token?.version !== 2 ||
+      token?.version !== IMPORT_TOKEN_VERSION ||
       !token.importerUserId ||
       !Number.isInteger(token.targetCareerId) ||
       !Array.isArray(token.rows) ||
@@ -667,9 +678,14 @@ export async function commitBulkStudentImport({ importId, importer, dependencies
       }
 
       await tx.query(
-        `INSERT INTO memberships (org_id, user_id, role)
-         VALUES ($1, $2, $3::membership_role)`,
-        [DEFAULT_ORG_ID, createdUserId, ROLES.STUDENT],
+        `INSERT INTO memberships (org_id, user_id, role, study_system)
+         VALUES ($1, $2, $3::membership_role, $4)`,
+        [
+          DEFAULT_ORG_ID,
+          createdUserId,
+          ROLES.STUDENT,
+          STUDENT_CSV_SYSTEMS.has(row.studySystem) ? row.studySystem : null,
+        ],
       );
       created += 1;
     }

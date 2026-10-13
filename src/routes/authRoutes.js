@@ -25,6 +25,8 @@ import { requireAuth } from "../middleware/auth.js";
 import {
   canImportStudents,
   getAssignableUserRoles,
+  isGlobalCareerAdmin,
+  isSuaDivisionCareer,
   PASSWORD_MANAGED_ROLES,
 } from "../services/adminUserCareerScope.js";
 import { createOAuthRateLimit } from "../middleware/oauthRateLimit.js";
@@ -513,6 +515,7 @@ router.get("/api/me", requireAuth, async (req, res) => {
               creatable_roles: getAssignableUserRoles(req.auth, userRow.career_name),
               can_import_students: canImportStudents(req.auth, userRow.career_name),
               password_roles: [...PASSWORD_MANAGED_ROLES],
+              views_sua_students: !isGlobalCareerAdmin(req.auth) && isSuaDivisionCareer(userRow.career_name),
             }
           : null,
       view_as: req.auth.viewAs

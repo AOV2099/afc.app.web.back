@@ -34,9 +34,12 @@ import {
   assertUserRoleAssignmentAccess,
   buildAdminCareerFilter,
   getScopedAdminCareerId,
+  isGlobalCareerAdmin,
+  isSuaDivisionCareer,
   loadAdminCareerName,
   lockAdminUserTarget,
   normalizeCareerId,
+  normalizeStudySystem,
   resolveAdminUserListCareerFilter,
   resolveEffectiveCreateCareer,
 } from "../services/adminUserCareerScope.js";
@@ -89,6 +92,7 @@ const ADMIN_USER_SORT_FIELDS = Object.freeze({
   account: "u.student_id",
   hours: "COALESCE(hb.hours_total, 0)",
   career: "LOWER(COALESCE(c.name, ''))",
+  system: "m.study_system",
   status: "u.status",
   role: "m.role::text",
 });
@@ -139,6 +143,14 @@ async function loadMembershipRole(db, userId) {
   );
   return result.rows?.[0]?.role ?? null;
 }
+
+function readStudySystemInput(body) {
+  const raw = body?.study_system !== undefined ? body.study_system : body?.studySystem;
+  return { provided: raw !== undefined, value: normalizeStudySystem(raw) };
+}
+
+const INVALID_STUDY_SYSTEM_MESSAGE = "Sistema inválido. Usa esc (escolarizado) o sua (abierta y a distancia).";
+const STUDY_SYSTEM_STUDENTS_ONLY_MESSAGE = "El sistema (ESC/SUA) solo aplica a usuarios con rol alumno.";
 
 function parseStudentCsvBody(req, res, next) {
   if (!req.is("text/csv")) {
@@ -347,10 +359,14 @@ router.get("/api/admin/users", requireAuth, requireCareerAdmin, async (req, res)
   const q = String(req.query?.q || "").trim().slice(0, 200);
   const status = req.query?.status ? String(req.query.status).trim() : undefined;
   const role = req.query?.role ? String(req.query.role).trim() : undefined;
+  const studySystemFilter = normalizeStudySystem(req.query?.study_system);
   const orderBy = resolveAdminUserOrder(req.query?.sortBy, req.query?.sortDirection);
 
   if (role !== undefined && !ALLOWED_MEMBERSHIP_ROLES.has(role)) {
     return res.status(400).json({ ok: false, message: "Rol inválido." });
+  }
+  if (studySystemFilter === undefined) {
+    return res.status(400).json({ ok: false, message: INVALID_STUDY_SYSTEM_MESSAGE });
   }
   if (!orderBy) {
     return res.status(400).json({ ok: false, message: "Ordenamiento inválido." });
@@ -360,15 +376,29 @@ router.get("/api/admin/users", requireAuth, requireCareerAdmin, async (req, res)
   const params = [DEFAULT_ORG_ID];
 
   try {
+    const includeSuaStudents =
+      !isGlobalCareerAdmin(req.auth) && isSuaDivisionCareer(await loadAdminCareerName({ query }, req.auth));
     const careerFilter = resolveAdminUserListCareerFilter(
       req.auth,
       req.query?.career_id,
       params.length + 1,
+      "u.career_id",
+      { includeSuaStudents },
     );
     if (careerFilter.clause) filters.push(careerFilter.clause);
     params.push(...careerFilter.params);
   } catch (error) {
+    if (!error?.statusCode) {
+      console.error("Error en GET /api/admin/users (alcance):", error?.message);
+      return res.status(500).json({ ok: false, message: "No se pudieron consultar los usuarios." });
+    }
     return sendScopeError(res, error);
+  }
+
+  if (studySystemFilter) {
+    const idx = params.length + 1;
+    filters.push(`m.study_system = $${idx}`);
+    params.push(studySystemFilter);
   }
 
   if (q) {
@@ -420,6 +450,7 @@ router.get("/api/admin/users", requireAuth, requireCareerAdmin, async (req, res)
          u.last_name,
          u.student_id,
          u.career_id,
+         m.study_system,
          u.status,
          u.created_at,
          COALESCE(hb.hours_total, 0)::numeric(10,2) AS hours_total,
@@ -523,6 +554,7 @@ router.post("/api/admin/users", requireAuth, requireCareerAdmin, async (req, res
   const careerInput = readCareerInput(req.body);
   const status = req.body?.status ? String(req.body.status).trim() : "active";
   const role = String(req.body?.role || ROLES.STUDENT).trim();
+  const studySystemInput = readStudySystemInput(req.body);
   const emailVerifiedInput = req.body?.email_verified ?? req.body?.emailVerified;
   const emailVerifiedAtInput = req.body?.email_verified_at ?? req.body?.emailVerifiedAt;
 
@@ -533,6 +565,13 @@ router.post("/api/admin/users", requireAuth, requireCareerAdmin, async (req, res
       ok: false,
       message: "Campos requeridos: email, password, firstName y lastName.",
     });
+  }
+
+  if (studySystemInput.value === undefined) {
+    return res.status(400).json({ ok: false, message: INVALID_STUDY_SYSTEM_MESSAGE });
+  }
+  if (studySystemInput.value !== null && role !== ROLES.STUDENT) {
+    return res.status(400).json({ ok: false, message: STUDY_SYSTEM_STUDENTS_ONLY_MESSAGE });
   }
 
   if (!email.includes("@")) {
@@ -625,12 +664,13 @@ router.post("/api/admin/users", requireAuth, requireCareerAdmin, async (req, res
       const createdUser = userInsert.rows[0];
 
       await tx.query(
-        `INSERT INTO memberships (org_id, user_id, role)
-         VALUES ($1, $2, $3::membership_role)
+        `INSERT INTO memberships (org_id, user_id, role, study_system)
+         VALUES ($1, $2, $3::membership_role, $4)
          ON CONFLICT (org_id, user_id)
-         DO UPDATE SET role = EXCLUDED.role`,
-        [DEFAULT_ORG_ID, createdUser.id, role],
+         DO UPDATE SET role = EXCLUDED.role, study_system = EXCLUDED.study_system`,
+        [DEFAULT_ORG_ID, createdUser.id, role, studySystemInput.value],
       );
+      createdUser.study_system = studySystemInput.value;
 
       const careerRow =
         createdUser.career_id === null
@@ -723,8 +763,12 @@ router.put("/api/admin/users/:userId", requireAuth, requireCareerAdmin, async (r
     studentId !== undefined ||
     careerInput.provided ||
     status !== undefined;
+  const studySystemInput = readStudySystemInput(req.body);
 
-  if (!hasUserUpdate && role === undefined) {
+  if (studySystemInput.value === undefined) {
+    return res.status(400).json({ ok: false, message: INVALID_STUDY_SYSTEM_MESSAGE });
+  }
+  if (!hasUserUpdate && role === undefined && !studySystemInput.provided) {
     return res.status(400).json({ ok: false, message: "No hay cambios para actualizar." });
   }
 
@@ -736,9 +780,21 @@ router.put("/api/admin/users/:userId", requireAuth, requireCareerAdmin, async (r
         includeAttributes: true,
       });
       assertRequestedCareerAccess(req.auth, careerInput);
-      if (role !== undefined && role !== (await loadMembershipRole(tx, userId))) {
+      const currentRole = await loadMembershipRole(tx, userId);
+      if (role !== undefined && role !== currentRole) {
         assertUserRoleAssignmentAccess(req.auth, role, adminCareerName);
       }
+      const resultingRole = role ?? currentRole;
+      if (studySystemInput.provided && studySystemInput.value !== null && resultingRole !== ROLES.STUDENT) {
+        const validationError = new Error(STUDY_SYSTEM_STUDENTS_ONLY_MESSAGE);
+        validationError.statusCode = 400;
+        throw validationError;
+      }
+      const studySystemUpdate = studySystemInput.provided
+        ? studySystemInput.value
+        : resultingRole !== ROLES.STUDENT && currentRole === ROLES.STUDENT
+          ? null
+          : undefined;
 
       const attributes = targetUser.attributes ?? null;
       if (attributes && attributes.event_staff === true) {
@@ -811,6 +867,13 @@ router.put("/api/admin/users/:userId", requireAuth, requireCareerAdmin, async (r
         );
       }
 
+      if (studySystemUpdate !== undefined) {
+        await tx.query(
+          `UPDATE memberships SET study_system = $3 WHERE org_id = $1 AND user_id = $2`,
+          [DEFAULT_ORG_ID, userId, studySystemUpdate],
+        );
+      }
+
       const finalResult = await tx.query(
         `SELECT
            u.id,
@@ -819,6 +882,7 @@ router.put("/api/admin/users/:userId", requireAuth, requireCareerAdmin, async (r
            u.last_name,
            u.student_id,
            u.career_id,
+           m.study_system,
            u.status,
            c.name AS career_name,
            c.faculty AS career_faculty,

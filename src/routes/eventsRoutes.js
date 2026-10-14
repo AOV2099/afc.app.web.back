@@ -851,8 +851,6 @@ async function getTimelineFromRedis({ eventId, type, from, to, limit }) {
     .filter(Boolean);
 }
 
-export const CLOSED_EVENT_STATUSES = ["ended", "cancelled"];
-
 export function parseEventStatusesParam(value) {
   const raw = Array.isArray(value) ? value : value === undefined || value === null ? [] : [value];
   const statuses = [...new Set(raw.flatMap((item) => String(item).split(",")).map((item) => item.trim()).filter(Boolean))];
@@ -869,7 +867,7 @@ export function buildEventConditions({
   startsTo,
   endsFrom,
   forcePublished,
-  hideClosedFromOtherCareersOf = null,
+  onlyPublishedFromOtherCareersOf = null,
 }) {
   const conditions = [];
   const params = [];
@@ -888,14 +886,13 @@ export function buildEventConditions({
     params.push(status);
   }
 
-  if (hideClosedFromOtherCareersOf !== null) {
-    const statusIdx = params.length + 1;
-    const careerIdx = params.length + 2;
+  if (onlyPublishedFromOtherCareersOf !== null) {
+    const careerIdx = params.length + 1;
     conditions.push(
-      `((e.status::text <> ALL($${statusIdx}::text[]) AND (e.ends_at IS NULL OR e.ends_at >= now()))
+      `((e.status = 'published'::event_status AND (e.ends_at IS NULL OR e.ends_at >= now()))
         OR EXISTS (SELECT 1 FROM users ou WHERE ou.id = e.created_by AND ou.career_id = $${careerIdx}))`,
     );
-    params.push(CLOSED_EVENT_STATUSES, hideClosedFromOtherCareersOf);
+    params.push(onlyPublishedFromOtherCareersOf);
   }
 
   if (q) {
@@ -955,7 +952,7 @@ async function listEvents({
   startsTo,
   endsFrom,
   forcePublished,
-  hideClosedFromOtherCareersOf = null,
+  onlyPublishedFromOtherCareersOf = null,
   includeStaff = false,
 }) {
   const pageRaw = res.req.query?.page ?? 1;
@@ -980,7 +977,7 @@ async function listEvents({
     startsTo,
     endsFrom,
     forcePublished,
-    hideClosedFromOtherCareersOf,
+    onlyPublishedFromOtherCareersOf,
   });
 
   const shiftedConditionsSql = buildEventWhereSql(conditions, 2);
@@ -2088,8 +2085,8 @@ router.get("/api/admin/events", requireAuth, requireEventManager, async (req, re
       startsFrom,
       startsTo,
       forcePublished: false,
-      // Los eventos pasados, finalizados o cancelados de otras áreas no le competen al admin de carrera.
-      hideClosedFromOtherCareersOf: isGlobalCareerAdmin(req.auth) ? null : normalizeCareerId(req.auth.careerId),
+      // De otras carreras, el admin de carrera solo ve los eventos publicados vigentes (sin poder editarlos).
+      onlyPublishedFromOtherCareersOf: isGlobalCareerAdmin(req.auth) ? null : normalizeCareerId(req.auth.careerId),
       includeStaff: true,
     });
 

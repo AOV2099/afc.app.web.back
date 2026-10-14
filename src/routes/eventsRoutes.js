@@ -1538,13 +1538,13 @@ router.post("/api/events/:eventId/unregister", requireAuth, async (req, res) => 
         throw createHttpError(404, "No existe inscripción para este evento.");
       }
 
+      // Eventos sin horas AFC (o con la meta ya cumplida) dejan movimientos de 0 hrs; también cuentan como asistencia.
       const attendanceResult = await tx.query(
         `SELECT 1
          FROM hours_ledger
          WHERE event_id = $1
            AND user_id = $2
            AND reason = 'checkin'::ledger_reason
-           AND hours_delta > 0
          LIMIT 1`,
         [eventId, userId],
       );
@@ -3890,6 +3890,10 @@ async function eventHasAttendance(db, eventId) {
 
 const ATTENDANCE_LOCKED_STATUSES = new Set(["ended", "cancelled"]);
 
+function isAfcHoursDisabled(updates) {
+  return updates.afc_hours_enabled !== undefined && !parseBooleanInput(updates.afc_hours_enabled, true);
+}
+
 // Las horas ya acreditadas no se recalculan; con asistencias solo se corrigen con ajuste manual.
 export function assertAttendanceLockedFields(existingEvent, updates) {
   const prefix = "El evento ya tiene asistencias registradas";
@@ -3903,7 +3907,9 @@ export function assertAttendanceLockedFields(existingEvent, updates) {
   const previousHours = existingEvent.hours_value === null ? null : Number(existingEvent.hours_value);
   const hoursChanged =
     updates.hours_value !== undefined && parsePlainDecimalOrNull(updates.hours_value) !== previousHours;
-  if ((updates.afc_valuation !== undefined && updates.afc_valuation !== null) || hoursChanged) {
+  const disablesAfc =
+    isAfcHoursDisabled(updates) && (Boolean(existingEvent.afc_valuation) || previousHours !== 0);
+  if ((updates.afc_valuation !== undefined && updates.afc_valuation !== null) || hoursChanged || disablesAfc) {
     throw createHttpError(
       409,
       `${prefix}: no se pueden cambiar sus horas ni su valoración AFC. Usa el ajuste manual de horas.`,
@@ -3985,18 +3991,23 @@ router.put("/api/admin/events/:eventId", requireAuth, requireAdmin, async (req, 
         throw validationError;
       }
 
+      const afcHoursDisabled = isAfcHoursDisabled(updates);
       let afcInput = null;
-      if (updates.afc_valuation !== undefined && updates.afc_valuation !== null) {
+      if (!afcHoursDisabled && updates.afc_valuation !== undefined && updates.afc_valuation !== null) {
         const normalizedAfc = normalizeAfcValuationInput(updates.afc_valuation);
         if (normalizedAfc.error) throw createHttpError(400, normalizedAfc.error);
         afcInput = normalizedAfc.value;
       }
-      const isAfcManaged = Boolean(afcInput || existingEvent.afc_valuation);
+      const isAfcManaged = !afcHoursDisabled && Boolean(afcInput || existingEvent.afc_valuation);
 
       let hoursValue;
       let afcValuation = existingEvent.afc_valuation ?? null;
       let afcEvidenceFileId = existingEvent.afc_evidence_file_id ?? null;
-      if (afcInput) {
+      if (afcHoursDisabled) {
+        hoursValue = 0;
+        afcValuation = null;
+        afcEvidenceFileId = null;
+      } else if (afcInput) {
         const prepared = await prepareEventHoursValuation(tx, { existing: existingEvent, input: afcInput });
         if (prepared.evidenceFileId) {
           await attachAfcEvidence(tx, {

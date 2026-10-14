@@ -93,8 +93,10 @@ export function normalizeCreateEventPayload(body) {
     return { error: "La fecha y hora de fin no son válidas." };
   }
 
+  // afc_hours_enabled: false = el evento no otorga horas AFC (0 hrs, sin valoración).
+  const afcHoursEnabled = parseBooleanInput(body?.afc_hours_enabled, true);
   let afc = null;
-  if (body?.afc_valuation !== undefined && body?.afc_valuation !== null) {
+  if (afcHoursEnabled && body?.afc_valuation !== undefined && body?.afc_valuation !== null) {
     const normalizedAfc = normalizeAfcValuationInput(body.afc_valuation);
     if (normalizedAfc.error) return { error: normalizedAfc.error };
     afc = normalizedAfc.value;
@@ -102,8 +104,10 @@ export function normalizeCreateEventPayload(body) {
 
   // Con valoración AFC las horas se calculan con el catálogo de la BD en la ruta (prepareEventHoursValuation);
   // se ignora hours_value del cliente. hours_value: null deja las horas pendientes (solo en borrador).
-  const hoursPending = !afc && body?.hours_value === null;
-  const hoursValue = afc || hoursPending
+  const hoursPending = afcHoursEnabled && !afc && body?.hours_value === null;
+  const hoursValue = !afcHoursEnabled
+    ? 0
+    : afc || hoursPending
     ? null
     : body?.hours_value === undefined
       ? 0

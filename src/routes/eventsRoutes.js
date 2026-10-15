@@ -1216,7 +1216,7 @@ router.post("/api/events/:eventId/register", requireAuth, async (req, res) => {
     const created = await withTransaction(async (tx) => {
       // FOR UPDATE serializa las inscripciones del evento para que el cupo no se rebase en paralelo.
       const eventResult = await tx.query(
-        `SELECT id, org_id, status, registration_mode, ends_at, capacity, capacity_enabled
+        `SELECT id, org_id, status, registration_mode, resubmission_policy, ends_at, capacity, capacity_enabled
          FROM events
          WHERE id = $1 AND org_id = $2
          LIMIT 1
@@ -1301,10 +1301,17 @@ router.post("/api/events/:eventId/register", requireAuth, async (req, res) => {
         }
 
         const canReRegister =
-          previousStatus === "cancelled_by_user" || previousStatus === "cancelled_by_admin";
+          previousStatus === "cancelled_by_user" ||
+          previousStatus === "cancelled_by_admin" ||
+          (previousStatus === "rejected" && String(event.resubmission_policy) === "allowed");
 
         if (!canReRegister) {
-          throw createHttpError(409, "Ya existe un registro para este evento.");
+          throw createHttpError(
+            409,
+            previousStatus === "rejected"
+              ? "Tu solicitud fue rechazada y este evento no permite volver a solicitar."
+              : "Ya existe un registro para este evento.",
+          );
         }
 
         await ensureCapacityAvailable();
@@ -1568,10 +1575,12 @@ router.post("/api/events/:eventId/unregister", requireAuth, async (req, res) => 
       const cancelDeadline = event.cancel_deadline ? new Date(event.cancel_deadline) : null;
       const afterDeadline = cancelDeadline ? now > cancelDeadline : false;
 
+      const cancelPolicy = String(event.cancel_policy);
+      // "Libre hasta fecha límite" se guarda como free_cancel con cancel_deadline.
       const requiresOrganizerValidation =
         registration.status === "approved" &&
-        (String(event.cancel_policy) === "locked" ||
-          (String(event.cancel_policy) === "penalize_no_show" && afterDeadline));
+        (cancelPolicy === "locked" ||
+          ((cancelPolicy === "penalize_no_show" || cancelPolicy === "free_cancel") && afterDeadline));
 
       if (requiresOrganizerValidation) {
         const payloadBase =

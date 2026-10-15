@@ -61,7 +61,7 @@ export function normalizeStudySystem(value) {
   return STUDY_SYSTEMS.has(normalized) ? normalized : undefined;
 }
 
-// Su admin puede consultar a los alumnos SUA de cualquier carrera (solo lectura).
+// Su admin consulta solo a los alumnos SUA, de cualquier carrera (solo lectura).
 export function isSuaDivisionCareer(careerName) {
   return normalizeCareerName(careerName).replace(/[^a-z]/gu, "").includes("universidadabiertacontinuayadistancia");
 }
@@ -156,9 +156,10 @@ export function resolveAdminUserListCareerFilter(
   { includeSuaStudents = false } = {},
 ) {
   const adminCareerId = requireValidAdminCareer(auth);
+  // Las carreras solo ven a su alumnado escolarizado; la División SUA solo ve alumnos SUA (de cualquier carrera).
   const ownCareerClause = includeSuaStudents
-    ? `(${column} = $${parameterIndex} OR m.study_system = 'sua')`
-    : `${column} = $${parameterIndex}`;
+    ? `((${column} = $${parameterIndex} AND m.study_system IS DISTINCT FROM 'esc') OR m.study_system = 'sua')`
+    : `(${column} = $${parameterIndex} AND m.study_system IS DISTINCT FROM 'sua')`;
   const requestedText =
     requestedValue === null || requestedValue === undefined
       ? ""

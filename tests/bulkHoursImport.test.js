@@ -58,7 +58,7 @@ test("applies the per-upload hours limit to each CSV row", () => {
   const csv = "numero_cuenta,horas,motivo\n123456789,250,Motivo válido largo";
   const capped = parseAndValidateHoursCsv(csv);
   assert.equal(capped.errors[0].code, "invalid_hours");
-  assert.match(capped.errors[0].message, /no exceder 200 /u);
+  assert.match(capped.errors[0].message, /no exceder 100 /u);
   assert.deepEqual(parseAndValidateHoursCsv(csv, { maxHours: null }).errors, []);
 });
 

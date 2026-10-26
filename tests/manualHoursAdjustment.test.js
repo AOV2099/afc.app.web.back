@@ -30,8 +30,8 @@ test("career admins are capped per upload and the global admin is not", async ()
     throw new Error("No debe abrir transacción");
   };
   await assert.rejects(
-    addManualAccountHours({ ...INPUT, hours: "200.01" }, { withTransactionFn: neverRuns }),
-    (error) => error.code === "invalid_hours" && /no exceder 200 /u.test(error.message),
+    addManualAccountHours({ ...INPUT, hours: "100.01" }, { withTransactionFn: neverRuns }),
+    (error) => error.code === "invalid_hours" && /no exceder 100 /u.test(error.message),
   );
 
   const tx = {
@@ -59,11 +59,11 @@ test("validates account, positive hours, motive, and request ID", () => {
   assert.equal(normalizeAccountNumber("1234567890"), "1234567890");
   assert.equal(normalizeAccountNumber("123"), null);
   assert.equal(normalizeManualHours("0.01"), 0.01);
-  assert.equal(normalizeManualHours("200.00"), 200);
+  assert.equal(normalizeManualHours("100.00"), 100);
   assert.equal(normalizeManualHours("0"), null);
-  assert.equal(normalizeManualHours("200.01"), null);
+  assert.equal(normalizeManualHours("100.01"), null);
   assert.equal(normalizeManualHours("1.001"), null);
-  assert.equal(normalizeManualHours("150", 100), null);
+  assert.equal(normalizeManualHours("150", 120), null);
   assert.equal(normalizeManualHours("9999.99", null), 9999.99);
   assert.equal(normalizeManualHours("10000", null), null);
   assert.equal(normalizeAdjustmentCategory(" Culturales "), "culturales");

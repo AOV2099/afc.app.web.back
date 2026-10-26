@@ -71,7 +71,7 @@ export const HOURS_UPLOAD_MAX_GLOBAL_ADMIN = parseHoursUploadLimit(
 );
 export const HOURS_UPLOAD_MAX_CAREER_ADMIN = parseHoursUploadLimit(
   process.env.HOURS_UPLOAD_MAX_CAREER_ADMIN,
-  200,
+  100,
 );
 
 // Archivos subidos: el contenido vive en FILE_STORAGE_DIR (volumen Docker) y la tabla files guarda la ubicación.

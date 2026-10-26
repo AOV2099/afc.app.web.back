@@ -30,6 +30,7 @@ test("authenticated sessions persist careerId and requireAuth exposes it", async
     role: "admin",
     careerId: 9,
     picture: null,
+    viewAs: null,
   });
 });
 

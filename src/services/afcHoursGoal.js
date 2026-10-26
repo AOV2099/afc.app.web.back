@@ -61,9 +61,5 @@ export async function loadUsersHoursProgress(executor, userIds) {
   return progress;
 }
 
+// Notas antiguas podían llevar " · Se han agregado X hrs"; se conserva para reconocerlas en reintentos.
 export const GOAL_CAP_NOTE_SEPARATOR = " · ";
-
-export function goalCapNote(credited, requested) {
-  if (!(credited < requested) || !(credited > 0)) return "";
-  return `${GOAL_CAP_NOTE_SEPARATOR}Se han agregado ${credited} hrs`;
-}

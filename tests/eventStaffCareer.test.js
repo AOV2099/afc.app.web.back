@@ -87,7 +87,7 @@ test("career 1 managers may assign staff from any career, including legacy null"
   }
 });
 
-test("event creation source assigns careers in both auto-created staff paths", async () => {
+test("bulk creation never auto-creates staff; single creation assigns the manager career", async () => {
   const source = await readFile(
     new URL("../src/routes/eventsRoutes.js", import.meta.url),
     "utf8",
@@ -101,11 +101,7 @@ test("event creation source assigns careers in both auto-created staff paths", a
   assert.ok(singleStart > bulkStart && updateStart > singleStart);
 
   const helperCreateSource = source.slice(helperStart, bulkStart);
-  assert.match(
-    helperCreateSource,
-    /INSERT INTO users \(email, password_hash, first_name, last_name, status, career_id, attributes\)/u,
-  );
-  assert.match(helperCreateSource, /RETURNING id, email, career_id/u);
+  assert.doesNotMatch(helperCreateSource, /INSERT INTO users/u);
   assert.match(helperCreateSource, /assertEventStaffCareer\(managerCareerId, staffUser\.career_id\)/u);
 
   const singleCreateSource = source.slice(singleStart, updateStart);

@@ -66,9 +66,79 @@ test("adds an auditable adjustment and returns the resulting balance", async () 
   assert.equal(result.hours_added, 2.5);
   assert.equal(result.total_hours, 12.5);
   assert.match(statements[0].sql, /FOR UPDATE OF u/u);
-  assert.match(statements[2].sql, /'adjustment'::ledger_reason/u);
-  assert.deepEqual(statements[2].params, ["21", 2.5, "7", INPUT.motive, INPUT.category, REQUEST_ID]);
+  const insert = statements.find((statement) => statement.sql.includes("INSERT INTO hours_ledger"));
+  assert.match(insert.sql, /'adjustment'::ledger_reason/u);
+  assert.deepEqual(insert.params, ["21", 2.5, "7", INPUT.motive, INPUT.category, REQUEST_ID]);
   assert.equal(result.entry.category, INPUT.category);
+});
+
+test("staff accounts never receive manual hours", async () => {
+  const tx = {
+    async query(sql) {
+      if (sql.includes("FROM users u")) {
+        return { rows: [{ id: "17", student_id: INPUT.accountNumber, career_id: 3, status: "active", role: "staff" }] };
+      }
+      throw new Error("No debe consultar m\u00e1s ni insertar horas");
+    },
+  };
+
+  await assert.rejects(
+    addManualAccountHours(INPUT, { withTransactionFn: transactionWith(tx) }),
+    (error) => error instanceof ManualHoursAdjustmentError && error.code === "staff_hours_not_allowed",
+  );
+});
+
+test("manual adjustments never exceed the career AFC goal", async () => {
+  let insertParams = null;
+  const tx = {
+    async query(sql, params) {
+      if (sql.includes("COALESCE(c.afc_hours")) return { rows: [{ goal: "240.00" }] };
+      if (sql.includes("FROM users u")) {
+        return { rows: [{ id: "21", career_id: 3, status: "active", role: "student" }] };
+      }
+      if (sql.includes("FROM event_categories")) return { rows: [{ key: INPUT.category }] };
+      if (sql.includes("AS total")) return { rows: [{ total: "239.00" }] };
+      if (sql.includes("INSERT INTO hours_ledger")) {
+        insertParams = params;
+        return { rows: [{ id: "30", user_id: "21", hours_delta: String(params[1]), reason: "adjustment", category: INPUT.category, note: params[3], created_at: new Date(), request_id: REQUEST_ID }] };
+      }
+      if (sql.includes("SUM(hours_delta)")) return { rows: [{ total_hours: "240.00" }] };
+      throw new Error("Consulta inesperada");
+    },
+  };
+
+  const result = await addManualAccountHours(INPUT, { withTransactionFn: transactionWith(tx) });
+  assert.equal(insertParams[1], 1);
+  assert.equal(insertParams[3], INPUT.motive.trim(), "las horas parciales no llevan leyenda");
+  assert.equal(result.hours_added, 1);
+  assert.equal(result.hours_requested, 2.5);
+  assert.equal(result.hours_goal, 240);
+});
+
+test("with the AFC goal already reached the adjustment records 0 hrs without a legend", async () => {
+  let insertParams = null;
+  const tx = {
+    async query(sql, params) {
+      if (sql.includes("COALESCE(c.afc_hours")) return { rows: [{ goal: "240.00" }] };
+      if (sql.includes("FROM users u")) {
+        return { rows: [{ id: "21", career_id: 3, status: "active", role: "student" }] };
+      }
+      if (sql.includes("FROM event_categories")) return { rows: [{ key: INPUT.category }] };
+      if (sql.includes("AS total_hours")) return { rows: [{ total_hours: "240.00" }] };
+      if (sql.includes("AS total")) return { rows: [{ total: "240.00" }] };
+      if (sql.includes("INSERT INTO hours_ledger")) {
+        insertParams = params;
+        return { rows: [{ id: "31", user_id: "21", hours_delta: String(params[1]), reason: "adjustment", category: INPUT.category, note: params[3], created_at: new Date(), request_id: REQUEST_ID }] };
+      }
+      throw new Error("Consulta inesperada");
+    },
+  };
+
+  const result = await addManualAccountHours(INPUT, { withTransactionFn: transactionWith(tx) });
+  assert.equal(insertParams[1], 0);
+  assert.equal(insertParams[3], INPUT.motive);
+  assert.equal(result.hours_added, 0);
+  assert.equal(result.total_hours, 240);
 });
 
 test("accepts any active role with an account number", async () => {
@@ -152,6 +222,7 @@ test("rejects an idempotency key reused with different data", async () => {
       if (sql.includes("WHERE request_id")) {
         return { rows: [{ id: "31", user_id: "99", created_by: "7", hours_delta: "2.50", note: INPUT.motive }] };
       }
+      if (sql.includes("SUM(hours_delta)")) return { rows: [{ total: "0" }] };
       throw new Error("Consulta inesperada");
     },
   };

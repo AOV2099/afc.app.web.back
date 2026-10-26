@@ -148,7 +148,7 @@ test("regional admin user-list filters resolve all and own career to one mandato
   const regional = { role: "admin", careerId: 7 };
   for (const value of [undefined, "", "all", "7", 7]) {
     assert.deepEqual(resolveAdminUserListCareerFilter(regional, value, 4), {
-      clause: "u.career_id = $4",
+      clause: "(u.career_id = $4 AND m.study_system IS DISTINCT FROM 'sua')",
       params: [7],
     });
   }

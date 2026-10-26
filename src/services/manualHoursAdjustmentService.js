@@ -1,7 +1,7 @@
 import { DEFAULT_ORG_ID, ROLES } from "../config/appConfig.js";
 import { withTransaction } from "../postgresClient.js";
 import { assertTargetCareerAccess } from "./adminUserCareerScope.js";
-import { capHoursToGoal, GOAL_CAP_NOTE_SEPARATOR, goalCapNote, loadUserHoursProgress } from "./afcHoursGoal.js";
+import { capHoursToGoal, GOAL_CAP_NOTE_SEPARATOR, loadUserHoursProgress } from "./afcHoursGoal.js";
 
 const ACCOUNT_NUMBER_PATTERN = /^\d{8,10}$/u;
 const HOURS_PATTERN = /^\d{1,3}(?:\.\d{1,2})?$/u;
@@ -156,7 +156,7 @@ export async function addManualAccountHours(
 
     const progress = await loadUserHoursProgress(tx, target.id);
     const creditedHours = capHoursToGoal(normalizedHours, progress.total, progress.goal);
-    const ledgerNote = `${normalizedMotive}${goalCapNote(creditedHours, normalizedHours)}`;
+    const ledgerNote = normalizedMotive;
 
     const insertResult = await tx.query(
       `INSERT INTO hours_ledger (

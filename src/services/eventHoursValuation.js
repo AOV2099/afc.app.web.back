@@ -1,12 +1,14 @@
 import { FILE_PURPOSES } from "../config/appConfig.js";
 import {
   AFC_KEY_PATTERN,
+  AFC_SCENARIO_KIND,
   AFC_VALUATION_MODE,
   afcSelectionFingerprint,
   calculateAfcHours,
   isAfcManualMode,
 } from "../catalogs/afcHoursCalc.js";
 import { findAfcActivityType, findAfcScenario } from "./afcCatalogRepository.js";
+import { eventDayKey } from "./eventAttendance.js";
 import { attachFileToEvent } from "./fileStorageService.js";
 
 export const HOURS_PENDING_ALLOWED_STATUSES = new Set(["draft", "cancelled"]);
@@ -43,7 +45,7 @@ export function normalizeAfcValuationInput(raw) {
   if (scenarioKey && !AFC_KEY_PATTERN.test(scenarioKey)) return { error: "El supuesto seleccionado no es válido." };
 
   if (raw.course_days !== undefined && raw.course_days !== null && !Array.isArray(raw.course_days)) {
-    return { error: "Las jornadas del curso no tienen un formato válido." };
+    return { error: "Las sesiones del curso no tienen un formato válido." };
   }
   const manualHours = raw.manual_hours;
   if (manualHours !== undefined && manualHours !== null && !["string", "number"].includes(typeof manualHours)) {
@@ -75,7 +77,20 @@ export function assertHoursAllowStatus(hoursValue, status) {
   }
 }
 
-async function calculateFromCatalog(executor, input) {
+/** Horas efectivas de cada sesión (fecha local y duración), en el formato de `course_days`. */
+export function courseDaysFromSessions(sessions) {
+  return (Array.isArray(sessions) ? sessions : [])
+    .map((session) => ({ start: new Date(session?.starts_at), end: new Date(session?.ends_at) }))
+    .filter(({ start, end }) => !Number.isNaN(start.getTime()) && !Number.isNaN(end.getTime()) && end > start)
+    .sort((a, b) => a.start - b.start)
+    .map(({ start, end }) => ({
+      date: eventDayKey(start),
+      effective_hours: String(Math.round(((end - start) / 3_600_000) * 100) / 100),
+    }));
+}
+
+// Con `sessions`, las horas de cursos salen del horario de las sesiones y no de lo capturado por el cliente.
+async function calculateFromCatalog(executor, input, sessions) {
   const type = await findAfcActivityType(executor, { origin: input.origin, typeKey: input.typeKey });
   if (!type) {
     throw new EventHoursValuationError(400, "El tipo de actividad seleccionado no existe en el catálogo AFC.", "invalid_type");
@@ -95,10 +110,14 @@ async function calculateFromCatalog(executor, input) {
     }
   }
 
+  const courseDays =
+    sessions !== undefined && scenario?.kind === AFC_SCENARIO_KIND.COURSE_DURATION
+      ? courseDaysFromSessions(sessions)
+      : input.courseDays;
   const calculation = calculateAfcHours({
     type,
     scenario,
-    inputs: { course_days: input.courseDays, manual_hours: input.manualHours },
+    inputs: { course_days: courseDays, manual_hours: input.manualHours },
   });
   if (!calculation.ok) {
     throw new EventHoursValuationError(400, calculation.message, calculation.code);
@@ -112,8 +131,21 @@ async function calculateFromCatalog(executor, input) {
  * Si la selección no cambió, conserva el valor vigente aunque el catálogo se haya editado después.
  * Devuelve { hoursValue, valuation, evidenceFileId }.
  */
-export async function prepareEventHoursValuation(executor, { existing = null, input }) {
-  const { type, scenario, valuation } = await calculateFromCatalog(executor, input);
+/** Un evento de varias sesiones solo puede valorarse con actividades marcadas como multisesión. */
+export async function assertAfcSessionsSupported(executor, { valuation, sessionCount }) {
+  if (!valuation?.type_key || Number(sessionCount) <= 1) return;
+  const type = await findAfcActivityType(executor, { origin: valuation.origin, typeKey: valuation.type_key });
+  if (type && !type.multi_session) {
+    throw new EventHoursValuationError(
+      400,
+      `La actividad AFC "${type.name}" no admite varias sesiones. Elige una actividad de varias sesiones o deja el evento en una sola sesión.`,
+      "afc_single_session",
+    );
+  }
+}
+
+export async function prepareEventHoursValuation(executor, { existing = null, input, sessions }) {
+  const { type, scenario, valuation } = await calculateFromCatalog(executor, input, sessions);
   const previousValuation = existing?.afc_valuation ?? null;
   const sameSelection =
     previousValuation !== null &&

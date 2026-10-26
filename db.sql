@@ -102,6 +102,53 @@ CREATE TABLE IF NOT EXISTS careers (
   UNIQUE (name)
 );
 
+-- clave_carrera: clave oficial UNAM de la carrera (NULL si aún no se conoce).
+-- afc_hours: meta de horas AFC de la carrera; los check-ins dejan de sumar al alcanzarla.
+ALTER TABLE careers
+  ADD COLUMN IF NOT EXISTS clave_carrera TEXT,
+  ADD COLUMN IF NOT EXISTS afc_hours NUMERIC(6,2) NOT NULL DEFAULT 480;
+
+CREATE UNIQUE INDEX IF NOT EXISTS uq_careers_clave_carrera
+  ON careers (clave_carrera)
+  WHERE clave_carrera IS NOT NULL;
+
+DO $$ BEGIN
+  ALTER TABLE careers
+    ADD CONSTRAINT chk_careers_afc_hours CHECK (afc_hours > 0);
+EXCEPTION WHEN duplicate_object THEN NULL; END $$;
+
+DO $$ BEGIN
+  ALTER TABLE careers
+    ADD CONSTRAINT chk_careers_clave_format CHECK (clave_carrera IS NULL OR clave_carrera ~ '^[0-9]{1,10}$');
+EXCEPTION WHEN duplicate_object THEN NULL; END $$;
+
+-- Horas de Formación Complementaria por carrera (FES Aragón).
+WITH career_data (name, clave_carrera, afc_hours) AS (
+  VALUES
+    ('Ingeniería Civil', '2236', 480),
+    ('Ingeniería en Computación', '2119', 480),
+    ('Ingeniería Eléctrica Electrónica', '2217', 480),
+    ('Ingeniería Industrial', '2195', 480),
+    ('Ingeniería Mecánica', '2187', 480),
+    ('Sociología', '2276', 480),
+    ('Derecho', '2254', 480),
+    ('Relaciones Internacionales', NULL, 480),
+    ('Comunicación y Periodismo', '2302', 480),
+    ('Arquitectura', '2336', 240)
+), updated AS (
+  UPDATE careers c
+  SET name = d.name,
+      clave_carrera = COALESCE(d.clave_carrera, c.clave_carrera),
+      afc_hours = d.afc_hours
+  FROM career_data d
+  WHERE lower(c.name) = lower(d.name)
+  RETURNING c.id
+)
+INSERT INTO careers (name, faculty, clave_carrera, afc_hours)
+SELECT d.name, 'FES Aragón', d.clave_carrera, d.afc_hours
+FROM career_data d
+WHERE NOT EXISTS (SELECT 1 FROM careers c WHERE lower(c.name) = lower(d.name));
+
 CREATE TABLE IF NOT EXISTS event_categories (
   key          TEXT PRIMARY KEY,
   name         TEXT NOT NULL,
@@ -186,6 +233,19 @@ ALTER TABLE users
 CREATE UNIQUE INDEX IF NOT EXISTS idx_users_oauth_identity
   ON users (oauth_provider, oauth_subject)
   WHERE oauth_provider IS NOT NULL AND oauth_subject IS NOT NULL;
+
+-- Sistema de estudios del alumno: esc = escolarizado, sua = universidad abierta / a distancia.
+ALTER TABLE memberships
+  ADD COLUMN IF NOT EXISTS study_system TEXT;
+
+DO $$ BEGIN
+  ALTER TABLE memberships
+    ADD CONSTRAINT chk_memberships_study_system CHECK (study_system IS NULL OR study_system IN ('esc', 'sua'));
+EXCEPTION WHEN duplicate_object THEN NULL; END $$;
+
+CREATE INDEX IF NOT EXISTS idx_memberships_study_system_sua
+  ON memberships (org_id, user_id)
+  WHERE study_system = 'sua';
 
 DO $$ BEGIN
   ALTER TABLE users
@@ -276,14 +336,15 @@ CREATE TABLE IF NOT EXISTS events (
   description           TEXT,
   starts_at             TIMESTAMPTZ NOT NULL,
   ends_at               TIMESTAMPTZ NOT NULL,
-  hours_value           NUMERIC(6,2) NOT NULL DEFAULT 0,
+  -- NULL = horas pendientes de valoración (solo borrador/cancelado)
+  hours_value           NUMERIC(6,2) DEFAULT 0,
   capacity              INTEGER,
   capacity_enabled      BOOLEAN NOT NULL DEFAULT false,
 
   -- Basic sanity checks
   CONSTRAINT chk_events_time_range CHECK (ends_at > starts_at),
   CONSTRAINT chk_events_hours_nonnegative CHECK (hours_value >= 0),
-  CONSTRAINT chk_events_hours_max CHECK (hours_value <= 100),
+  CONSTRAINT chk_events_hours_max CHECK (hours_value IS NULL OR hours_value <= 200),
   CONSTRAINT chk_events_capacity_nonnegative CHECK (capacity IS NULL OR capacity >= 0),
   CONSTRAINT chk_events_capacity_when_enabled CHECK (
     (capacity_enabled = false AND capacity IS NULL)
@@ -351,12 +412,309 @@ WHERE attributes ? 'cupo'
   AND (attributes->>'cupo') ~ '^\s*\d+\s*$'
   AND capacity IS NULL;
 
+-- Solo filas que cambian: tocar todas re-evalúa los checks NOT VALID sobre datos históricos.
 UPDATE events
-SET capacity_enabled = (capacity IS NOT NULL AND capacity > 0);
+SET capacity_enabled = (capacity IS NOT NULL AND capacity > 0)
+WHERE capacity_enabled IS DISTINCT FROM (capacity IS NOT NULL AND capacity > 0);
 
 UPDATE events
 SET attributes = attributes - 'cupo'
 WHERE attributes ? 'cupo';
+
+-- ----------
+-- AFC hours valuation (tipo de evento / actividad realizada)
+-- ----------
+
+-- NOT VALID: se aplica a filas nuevas/modificadas sin alterar horas históricas existentes.
+ALTER TABLE events ALTER COLUMN hours_value DROP NOT NULL;
+ALTER TABLE events DROP CONSTRAINT IF EXISTS chk_events_hours_max;
+ALTER TABLE events
+  ADD CONSTRAINT chk_events_hours_max CHECK (hours_value IS NULL OR hours_value <= 200) NOT VALID;
+ALTER TABLE events DROP CONSTRAINT IF EXISTS chk_events_hours_required_when_active;
+ALTER TABLE events
+  ADD CONSTRAINT chk_events_hours_required_when_active
+  CHECK (hours_value IS NOT NULL OR status IN ('draft', 'cancelled')) NOT VALID;
+
+-- Los borradores pueden guardarse sin fechas; al publicarse son obligatorias.
+ALTER TABLE events ALTER COLUMN starts_at DROP NOT NULL;
+ALTER TABLE events ALTER COLUMN ends_at DROP NOT NULL;
+ALTER TABLE events DROP CONSTRAINT IF EXISTS chk_events_schedule_required_when_active;
+ALTER TABLE events
+  ADD CONSTRAINT chk_events_schedule_required_when_active
+  CHECK ((starts_at IS NOT NULL AND ends_at IS NOT NULL) OR status IN ('draft', 'cancelled')) NOT VALID;
+
+-- Eventos de varias sesiones: % mínimo de sesiones asistidas para acreditar las horas AFC (100 = todas).
+ALTER TABLE events
+  ADD COLUMN IF NOT EXISTS min_attendance_percent SMALLINT NOT NULL DEFAULT 100;
+DO $$ BEGIN
+  ALTER TABLE events
+    ADD CONSTRAINT chk_events_min_attendance_percent CHECK (min_attendance_percent BETWEEN 1 AND 100);
+EXCEPTION WHEN duplicate_object THEN NULL; END $$;
+
+-- Snapshot of the applied rule (type, scenario, range, percent, inputs, result).
+-- NULL = legacy event whose hours were entered before the AFC catalog.
+ALTER TABLE events
+  ADD COLUMN IF NOT EXISTS afc_valuation JSONB;
+
+-- Actividades AFC (tablas de los Criterios Internos, art. 6 y 7).
+-- valuation_mode: scenarios = supuestos del tabulador; manual = horas libres dentro del rango
+-- con evidencia opcional; committee = horas libres con dictamen obligatorio.
+CREATE TABLE IF NOT EXISTS afc_activity_types (
+  id              BIGSERIAL PRIMARY KEY,
+  origin          TEXT NOT NULL CHECK (origin IN ('fes_aragon', 'external')),
+  key             TEXT NOT NULL CHECK (key ~ '^[a-z0-9_]{1,64}$'),
+  name            TEXT NOT NULL CHECK (length(trim(name)) BETWEEN 1 AND 160),
+  description     TEXT,
+  requirements    TEXT,
+  min_hours       NUMERIC(6,2),
+  max_hours       NUMERIC(6,2),
+  valuation_mode  TEXT NOT NULL CHECK (valuation_mode IN ('scenarios', 'manual', 'committee')),
+  sort_order      INTEGER NOT NULL DEFAULT 0,
+  is_active       BOOLEAN NOT NULL DEFAULT true,
+  created_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
+  updated_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
+  updated_by      BIGINT REFERENCES users(id) ON DELETE SET NULL,
+  CONSTRAINT chk_afc_types_range CHECK (
+    (valuation_mode = 'committee' AND min_hours IS NULL AND max_hours IS NULL)
+    OR (
+      valuation_mode <> 'committee'
+      AND max_hours IS NOT NULL AND max_hours > 0 AND max_hours <= 200
+      AND (min_hours IS NULL OR (min_hours >= 0 AND min_hours <= max_hours))
+    )
+  ),
+  UNIQUE (origin, key)
+);
+
+-- Supuestos del Tabulador indicativo por actividad.
+CREATE TABLE IF NOT EXISTS afc_valuation_scenarios (
+  id                BIGSERIAL PRIMARY KEY,
+  activity_type_id  BIGINT NOT NULL REFERENCES afc_activity_types(id) ON DELETE CASCADE,
+  key               TEXT NOT NULL CHECK (key ~ '^[a-z0-9_]{1,64}$'),
+  label             TEXT NOT NULL CHECK (length(trim(label)) BETWEEN 1 AND 200),
+  kind              TEXT NOT NULL CHECK (kind IN ('percent', 'fixed_hours', 'course_duration')),
+  percent           NUMERIC(7,4),
+  fixed_hours       NUMERIC(6,2),
+  sort_order        INTEGER NOT NULL DEFAULT 0,
+  is_active         BOOLEAN NOT NULL DEFAULT true,
+  created_at        TIMESTAMPTZ NOT NULL DEFAULT now(),
+  updated_at        TIMESTAMPTZ NOT NULL DEFAULT now(),
+  updated_by        BIGINT REFERENCES users(id) ON DELETE SET NULL,
+  CONSTRAINT chk_afc_scenarios_kind CHECK (
+    (kind = 'percent' AND percent IS NOT NULL AND percent BETWEEN 0 AND 100 AND fixed_hours IS NULL)
+    OR (kind = 'fixed_hours' AND fixed_hours IS NOT NULL AND fixed_hours > 0 AND percent IS NULL)
+    OR (kind = 'course_duration' AND percent IS NULL AND fixed_hours IS NULL)
+  ),
+  UNIQUE (activity_type_id, key)
+);
+
+CREATE INDEX IF NOT EXISTS idx_afc_types_origin_order
+  ON afc_activity_types (origin, sort_order, id);
+CREATE INDEX IF NOT EXISTS idx_afc_scenarios_type_order
+  ON afc_valuation_scenarios (activity_type_id, sort_order, id);
+
+-- Seed inicial; ON CONFLICT DO NOTHING conserva los cambios hechos desde el panel de administración.
+INSERT INTO afc_activity_types
+  (origin, key, name, description, requirements, min_hours, max_hours, valuation_mode, sort_order)
+VALUES
+  ('fes_aragon', 'conferences', 'Conferencias',
+   'Asistencia o ponencia en charlas, conferencias o pláticas.',
+   'Constancia o registro de asistencia emitido por la organización.', 10, 50, 'scenarios', 10),
+  ('fes_aragon', 'stands', 'Stands informativos o de proyectos',
+   'Participación en el montaje, atención y desmontaje de estands durante ferias, exposiciones o actividades académicas.',
+   'Participar activamente en al menos un turno completo.', 5, 20, 'scenarios', 20),
+  ('fes_aragon', 'congresses', 'Congresos',
+   'Participación en congresos con varias actividades académicas en su programa.',
+   'Participar en al menos 5 actividades del congreso.', 100, 200, 'scenarios', 30),
+  ('fes_aragon', 'courses', 'Talleres y cursos',
+   'Actividades prácticas o teóricas orientadas al aprendizaje de habilidades o conocimientos específicos.',
+   'Constancia con número de horas o, en su defecto, registro diario.', NULL, 150, 'scenarios', 40),
+  ('fes_aragon', 'seminars', 'Seminarios internos',
+   'Ciclos de sesiones periódicas sobre un tema especializado, organizados por carreras, coordinaciones o centros.',
+   'Constancia de participación en al menos 80 % de las sesiones.', 30, 80, 'scenarios', 50),
+  ('fes_aragon', 'academic_events', 'Eventos académicos',
+   'Actividades como coloquios, simposios, torneos o festivales.',
+   'Constancia oficial de participación.', 20, 100, 'scenarios', 60),
+  ('fes_aragon', 'institutional_participation', 'Participación en cuestiones institucionales',
+   'Apoyo como brigadista, staff en eventos, logística o cuidado de estands.',
+   'Carta o constancia de la instancia responsable.', 20, 80, 'scenarios', 70),
+  ('fes_aragon', 'institutional_support_projects', 'Proyectos institucionales de apoyo',
+   'Programas, ferias o actividades.',
+   'Registro o constancia de la dependencia organizadora.', 20, 100, 'manual', 80),
+  ('fes_aragon', 'cultural', 'Actividades culturales',
+   'Actividades culturales (presentaciones, festivales, muestras, círculos de lectura, etc.).',
+   'Constancia o registro oficial.', 20, 100, 'manual', 90),
+  ('fes_aragon', 'sports', 'Actividades deportivas',
+   'Actividades deportivas (torneos, clínicas, exhibiciones).',
+   'Constancia o registro oficial.', 20, 100, 'manual', 100),
+  ('fes_aragon', 'research', 'Actividades de investigación',
+   'Participación en proyectos, laboratorios, seminarios o apoyo a docentes o investigación.',
+   'Carta o constancia del responsable del proyecto con periodo y tareas.', 40, 200, 'scenarios', 110),
+  ('fes_aragon', 'entrepreneurship', 'Actividades de emprendimiento',
+   'Retos, hackathons, incubación o ferias de emprendimiento.',
+   'Constancia de participación y, si aplica, evidencia del proyecto.', 40, 150, 'scenarios', 120),
+  ('fes_aragon', 'social_responsibility', 'Actividades de responsabilidad social',
+   'Brigadas y campañas (salud, inclusión, sostenibilidad, etc.).',
+   'Constancia de la instancia responsable.', 20, 100, 'scenarios', 130),
+  ('fes_aragon', 'outreach', 'Actividades de vinculación',
+   'Actividades coordinadas con sectores público, privado o social.',
+   'Constancia de coordinación o participación.', 20, 120, 'scenarios', 140),
+  ('fes_aragon', 'human_development', 'Actividades de formación humana',
+   'Actividades sobre habilidades socioemocionales, ética, valores, liderazgo o comunicación.',
+   'Constancia de participación.', 20, 80, 'scenarios', 150),
+  ('fes_aragon', 'committee', 'Actividades validadas por el Comité de Carrera',
+   'Actividades no previstas en el tabulador o méritos excepcionales de carácter académico, cultural, deportivo, institucional o formativo.',
+   'Dictamen y justificación aprobada por el Comité de Carrera.', NULL, NULL, 'committee', 160),
+
+  ('external', 'ext_contest_participation', 'Concursos: participación',
+   'Participación en concursos culturales, deportivos, académicos o de innovación.',
+   'Constancia oficial de participación.', 20, 30, 'manual', 10),
+  ('external', 'ext_contest_podium', 'Concursos: 1.º, 2.º o 3.º lugar',
+   'Obtención de primeros lugares en concursos externos (nacionales o internacionales).',
+   'Constancia oficial con lugar obtenido.', 80, 150, 'manual', 20),
+  ('external', 'ext_contest_other', 'Concursos: otros lugares destacados',
+   'Obtención de menciones honoríficas, semifinales u otros reconocimientos.',
+   'Constancia oficial con lugar obtenido.', 30, 80, 'manual', 30),
+  ('external', 'ext_course_defined', 'Cursos/talleres externos con horas definidas',
+   'Cursos organizados por dependencias de la UNAM o por instituciones externas.',
+   'Constancia con número de horas y sello oficial.', NULL, 150, 'scenarios', 40),
+  ('external', 'ext_course_undefined', 'Cursos/talleres externos sin horas definidas',
+   'Actividades de capacitación sin carga horaria explícita.',
+   'Constancia oficial de asistencia.', 20, 50, 'scenarios', 50),
+  ('external', 'ext_event_attendance', 'Asistencia a eventos externos',
+   'Participación como asistente en actividades culturales, artísticas, académicas o deportivas.',
+   'Boleto, ticket o constancia con nombre del estudiante junto con reporte escrito con fotografía.', 20, 30, 'manual', 60),
+  ('external', 'ext_museum', 'Visitas a museos o exposiciones',
+   'Visitas con valor cultural, académico o de divulgación científica.',
+   'Boleto, ticket o constancia con nombre del estudiante junto con reporte escrito con fotografía.', 20, 30, 'manual', 70),
+  ('external', 'ext_congress', 'Congresos externos',
+   'Participación en congresos nacionales o internacionales.',
+   'Constancia oficial con nombre y programa.', 100, 200, 'manual', 80),
+  ('external', 'ext_research', 'Proyectos externos de investigación',
+   'Participación en proyectos de investigación en otras dependencias de la UNAM o instituciones externas.',
+   'Carta o constancia del responsable del proyecto.', 40, 200, 'manual', 90),
+  ('external', 'ext_entrepreneurship', 'Eventos de emprendimiento externos',
+   'Retos, ferias o programas de incubación.',
+   'Constancia oficial y evidencia de participación.', 40, 150, 'manual', 100),
+  ('external', 'ext_internship', 'Prácticas profesionales o estancias cortas',
+   'Participación en estancias cortas, prácticas o voluntariado académico.',
+   'Carta o constancia de la institución receptora.', 40, 200, 'manual', 110),
+  ('external', 'ext_social_responsibility', 'Actividades de responsabilidad social externas',
+   'Participación en brigadas, voluntariado o campañas en instituciones externas (ONGs, gobiernos, asociaciones de asistencia social o civil).',
+   'Constancia de la instancia organizadora.', 20, 120, 'manual', 120),
+  ('external', 'ext_outreach', 'Actividades de vinculación externas',
+   'Participación en convenios, proyectos o colaboraciones con empresas u organismos externos.',
+   'Constancia de participación o carta institucional.', 20, 150, 'manual', 130),
+  ('external', 'ext_human_development', 'Actividades de formación humana externas',
+   'Participación en actividades de desarrollo personal, ética, valores, liderazgo o comunicación.',
+   'Constancia oficial de participación.', 20, 80, 'manual', 140),
+  ('external', 'ext_committee', 'Actividades validadas por el Comité de Carrera',
+   'Actividades no previstas en el tabulador o méritos excepcionales de carácter académico, cultural, deportivo, institucional o formativo.',
+   'Dictamen y justificación aprobada por el Comité de Carrera.', NULL, NULL, 'committee', 150)
+ON CONFLICT (origin, key) DO NOTHING;
+
+INSERT INTO afc_valuation_scenarios
+  (activity_type_id, key, label, kind, percent, fixed_hours, sort_order)
+SELECT t.id, s.key, s.label, s.kind, s.percent, s.fixed_hours, s.sort_order
+FROM (VALUES
+  ('fes_aragon', 'conferences', 'conf_internal_attendance', 'Asistencia a conferencia interna', 'percent', 20::numeric, NULL::numeric, 10),
+  ('fes_aragon', 'conferences', 'conf_career_division', 'Asistencia a conferencia organizada por la carrera o división', 'percent', 30, NULL, 20),
+  ('fes_aragon', 'conferences', 'conf_fes_authorities', 'Asistencia a conferencia impartida por autoridades de la FES Aragón', 'percent', 40, NULL, 30),
+  ('fes_aragon', 'conferences', 'conf_unam_authorities', 'Asistencia a conferencia impartida por autoridades universitarias de la UNAM', 'percent', 50, NULL, 40),
+  ('fes_aragon', 'conferences', 'conf_external_specialist', 'Asistencia a conferencia con especialista externo', 'percent', 60, NULL, 50),
+  ('fes_aragon', 'conferences', 'conf_recognized_specialist', 'Conferencia impartida por especialista reconocido o invitado internacional', 'percent', 80, NULL, 60),
+  ('fes_aragon', 'conferences', 'conf_moderator', 'Participación como moderador o apoyo académico', 'percent', 80, NULL, 70),
+  ('fes_aragon', 'conferences', 'conf_organizer_speaker', 'Participación como organizador o ponente', 'percent', 100, NULL, 80),
+
+  ('fes_aragon', 'stands', 'stand_basic', 'Participación básica en atención del stand', 'percent', 25, NULL, 10),
+  ('fes_aragon', 'stands', 'stand_full_shift', 'Participación durante un turno completo', 'percent', 50, NULL, 20),
+  ('fes_aragon', 'stands', 'stand_multi_shift_demo', 'Participación en más de un turno o con demostración técnica', 'percent', 75, NULL, 30),
+  ('fes_aragon', 'stands', 'stand_lead', 'Responsable del stand o coordinación de actividades', 'percent', 100, NULL, 40),
+
+  ('fes_aragon', 'congresses', 'congress_min_activities', 'Asistencia al mínimo de actividades requeridas', 'percent', 50, NULL, 10),
+  ('fes_aragon', 'congresses', 'congress_full_program', 'Participación completa en el programa del congreso', 'percent', 60, NULL, 20),
+  ('fes_aragon', 'congresses', 'congress_workshops', 'Participación en talleres o actividades académicas adicionales', 'percent', 75, NULL, 30),
+  ('fes_aragon', 'congresses', 'congress_poster_talk', 'Presentación de cartel o ponencia', 'percent', 90, NULL, 40),
+  ('fes_aragon', 'congresses', 'congress_outstanding', 'Participación destacada u organización académica', 'percent', 100, NULL, 50),
+
+  ('fes_aragon', 'courses', 'course_defined_duration', 'Curso o taller con duración definida (horas × 2)', 'course_duration', NULL, NULL, 10),
+  ('fes_aragon', 'courses', 'course_ref_basic', 'Sin horas definidas: asistencia básica', 'fixed_hours', NULL, 20, 20),
+  ('fes_aragon', 'courses', 'course_ref_full_evidence', 'Sin horas definidas: participación completa con evidencia', 'fixed_hours', NULL, 30, 30),
+  ('fes_aragon', 'courses', 'course_ref_specialized', 'Sin horas definidas: curso especializado con producto final', 'fixed_hours', NULL, 40, 40),
+  ('fes_aragon', 'courses', 'course_ref_intensive', 'Sin horas definidas: curso intensivo validado académicamente', 'fixed_hours', NULL, 50, 50),
+
+  ('fes_aragon', 'seminars', 'seminar_min_attendance', 'Participación con asistencia mínima requerida', 'percent', 37.5, NULL, 10),
+  ('fes_aragon', 'seminars', 'seminar_constant', 'Participación constante en sesiones', 'percent', 50, NULL, 20),
+  ('fes_aragon', 'seminars', 'seminar_active', 'Participación activa en discusiones o relatorías', 'percent', 62.5, NULL, 30),
+  ('fes_aragon', 'seminars', 'seminar_presentation', 'Presentación de tema o trabajo académico', 'percent', 75, NULL, 40),
+  ('fes_aragon', 'seminars', 'seminar_coordination', 'Coordinación o apoyo académico relevante', 'percent', 100, NULL, 50),
+
+  ('fes_aragon', 'academic_events', 'academic_general', 'Asistencia general', 'percent', 20, NULL, 10),
+  ('fes_aragon', 'academic_events', 'academic_specific', 'Participación en actividad específica', 'percent', 40, NULL, 20),
+  ('fes_aragon', 'academic_events', 'academic_active_support', 'Participación activa o apoyo en actividades', 'percent', 60, NULL, 30),
+  ('fes_aragon', 'academic_events', 'academic_presentation', 'Presentación o demostración académica', 'percent', 80, NULL, 40),
+  ('fes_aragon', 'academic_events', 'academic_coordination', 'Coordinación o liderazgo en el evento', 'percent', 100, NULL, 50),
+
+  ('fes_aragon', 'institutional_participation', 'institutional_basic_staff', 'Apoyo básico como brigadista o staff', 'percent', 25, NULL, 10),
+  ('fes_aragon', 'institutional_participation', 'institutional_logistics', 'Participación en logística institucional', 'percent', 50, NULL, 20),
+  ('fes_aragon', 'institutional_participation', 'institutional_organization', 'Apoyo relevante en organización', 'percent', 75, NULL, 30),
+  ('fes_aragon', 'institutional_participation', 'institutional_team_coordination', 'Coordinación de equipo o actividad', 'percent', 100, NULL, 40),
+
+  ('fes_aragon', 'research', 'research_basic', 'Apoyo básico en proyecto de investigación', 'percent', 20, NULL, 10),
+  ('fes_aragon', 'research', 'research_continuous', 'Participación continua en actividades del proyecto', 'percent', 40, NULL, 20),
+  ('fes_aragon', 'research', 'research_technical', 'Participación técnica o metodológica', 'percent', 60, NULL, 30),
+  ('fes_aragon', 'research', 'research_products', 'Participación con resultados o productos académicos', 'percent', 80, NULL, 40),
+  ('fes_aragon', 'research', 'research_outstanding', 'Participación destacada con contribución académica', 'percent', 100, NULL, 50),
+
+  ('fes_aragon', 'entrepreneurship', 'entrepreneurship_basic', 'Participación básica en reto o hackathon', 'percent', 27, NULL, 10),
+  ('fes_aragon', 'entrepreneurship', 'entrepreneurship_full', 'Participación completa en actividad', 'percent', 40, NULL, 20),
+  ('fes_aragon', 'entrepreneurship', 'entrepreneurship_prototype', 'Desarrollo de prototipo o propuesta', 'percent', 60, NULL, 30),
+  ('fes_aragon', 'entrepreneurship', 'entrepreneurship_presentation', 'Presentación formal del proyecto', 'percent', 80, NULL, 40),
+  ('fes_aragon', 'entrepreneurship', 'entrepreneurship_outstanding', 'Proyecto destacado o incubación', 'percent', 100, NULL, 50),
+
+  ('fes_aragon', 'social_responsibility', 'social_basic', 'Participación básica en brigada o campaña', 'percent', 20, NULL, 10),
+  ('fes_aragon', 'social_responsibility', 'social_continuous', 'Participación continua', 'percent', 40, NULL, 20),
+  ('fes_aragon', 'social_responsibility', 'social_defined_tasks', 'Participación con tareas definidas', 'percent', 60, NULL, 30),
+  ('fes_aragon', 'social_responsibility', 'social_coordination', 'Apoyo en coordinación', 'percent', 80, NULL, 40),
+  ('fes_aragon', 'social_responsibility', 'social_operational', 'Responsabilidad operativa relevante', 'percent', 100, NULL, 50),
+
+  ('fes_aragon', 'outreach', 'outreach_basic', 'Participación básica', 'fixed_hours', NULL, 20, 10),
+  ('fes_aragon', 'outreach', 'outreach_collaboration_project', 'Participación en proyecto de colaboración', 'fixed_hours', NULL, 40, 20),
+  ('fes_aragon', 'outreach', 'outreach_active_evidence', 'Participación activa con evidencia', 'fixed_hours', NULL, 60, 30),
+  ('fes_aragon', 'outreach', 'outreach_representation', 'Representación institucional', 'fixed_hours', NULL, 90, 40),
+  ('fes_aragon', 'outreach', 'outreach_leadership', 'Liderazgo o gestión relevante', 'fixed_hours', NULL, 120, 50),
+
+  ('fes_aragon', 'human_development', 'human_attendance', 'Asistencia a actividad formativa', 'fixed_hours', NULL, 20, 10),
+  ('fes_aragon', 'human_development', 'human_continuous', 'Participación continua', 'fixed_hours', NULL, 40, 20),
+  ('fes_aragon', 'human_development', 'human_active_evidence', 'Participación activa con evidencia', 'fixed_hours', NULL, 60, 30),
+  ('fes_aragon', 'human_development', 'human_organization', 'Organización o facilitación', 'fixed_hours', NULL, 80, 40),
+
+  ('external', 'ext_course_defined', 'course_defined_duration', 'Curso o taller con duración definida (horas × 2)', 'course_duration', NULL, NULL, 10),
+  ('external', 'ext_course_undefined', 'course_ref_basic', 'Asistencia básica', 'fixed_hours', NULL, 20, 10),
+  ('external', 'ext_course_undefined', 'course_ref_full_evidence', 'Participación completa con evidencia', 'fixed_hours', NULL, 30, 20),
+  ('external', 'ext_course_undefined', 'course_ref_specialized', 'Curso especializado con producto final', 'fixed_hours', NULL, 40, 30),
+  ('external', 'ext_course_undefined', 'course_ref_intensive', 'Curso intensivo validado académicamente', 'fixed_hours', NULL, 50, 40)
+) AS s(origin, type_key, key, label, kind, percent, fixed_hours, sort_order)
+JOIN afc_activity_types t ON t.origin = s.origin AND t.key = s.type_key
+ON CONFLICT (activity_type_id, key) DO NOTHING;
+
+-- Actividades que pueden organizarse en varias sesiones (eventos con % mínimo de asistencia).
+-- La marca inicial solo se aplica al crear la columna para no pisar cambios hechos desde el catálogo.
+DO $$ BEGIN
+  IF NOT EXISTS (
+    SELECT 1 FROM information_schema.columns
+    WHERE table_name = 'afc_activity_types' AND column_name = 'multi_session'
+  ) THEN
+    ALTER TABLE afc_activity_types ADD COLUMN multi_session BOOLEAN NOT NULL DEFAULT false;
+    UPDATE afc_activity_types
+    SET multi_session = true
+    WHERE (origin, key) IN (
+      ('fes_aragon', 'courses'), ('fes_aragon', 'seminars'), ('fes_aragon', 'congresses'),
+      ('fes_aragon', 'academic_events'), ('fes_aragon', 'committee'),
+      ('external', 'ext_course_defined'), ('external', 'ext_course_undefined'),
+      ('external', 'ext_congress'), ('external', 'ext_committee')
+    );
+  END IF;
+END $$;
 
 CREATE TABLE IF NOT EXISTS event_geo (
   event_id              BIGINT PRIMARY KEY REFERENCES events(id) ON DELETE CASCADE,
@@ -424,6 +782,53 @@ CREATE INDEX IF NOT EXISTS idx_tickets_status ON tickets (status);
 CREATE INDEX IF NOT EXISTS idx_tickets_user_active
   ON tickets (user_id, event_id)
   WHERE status = 'active';
+
+-- ----------
+-- Archivos subidos (evidencias AFC y, a futuro, evidencias de participación o requisitos de inscripción)
+-- ----------
+-- El contenido vive en el almacenamiento configurado (volumen Docker); aquí solo la ubicación y metadatos.
+-- status: staged = subido pero aún no ligado a su entidad; se depura tras 24 h.
+
+CREATE TABLE IF NOT EXISTS files (
+  id                BIGSERIAL PRIMARY KEY,
+  org_id            BIGINT NOT NULL REFERENCES orgs(id) ON DELETE CASCADE,
+  storage_provider  TEXT NOT NULL DEFAULT 'local' CHECK (storage_provider IN ('local')),
+  storage_key       TEXT NOT NULL UNIQUE,
+  original_name     TEXT NOT NULL,
+  mime_type         TEXT NOT NULL,
+  size_bytes        BIGINT NOT NULL CHECK (size_bytes > 0),
+  sha256            TEXT NOT NULL CHECK (sha256 ~ '^[0-9a-f]{64}$'),
+  purpose           TEXT NOT NULL CHECK (purpose IN (
+                      'afc_hours_evidence',
+                      'participation_evidence',
+                      'registration_requirement',
+                      'event_cover',
+                      'other'
+                    )),
+  status            TEXT NOT NULL DEFAULT 'staged' CHECK (status IN ('staged', 'attached', 'deleted')),
+  uploaded_by       BIGINT REFERENCES users(id) ON DELETE SET NULL,
+  event_id          BIGINT REFERENCES events(id) ON DELETE SET NULL,
+  registration_id   BIGINT REFERENCES registrations(id) ON DELETE SET NULL,
+  metadata          JSONB NOT NULL DEFAULT '{}'::jsonb,
+  created_at        TIMESTAMPTZ NOT NULL DEFAULT now(),
+  attached_at       TIMESTAMPTZ,
+  deleted_at        TIMESTAMPTZ
+);
+
+CREATE INDEX IF NOT EXISTS idx_files_event ON files (event_id, created_at DESC) WHERE event_id IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_files_registration ON files (registration_id) WHERE registration_id IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_files_staged ON files (uploaded_by, created_at) WHERE status = 'staged';
+CREATE INDEX IF NOT EXISTS idx_files_purpose ON files (purpose, created_at DESC);
+
+-- Evidencia de horas AFC vigente del evento (obligatoria en Comité de Carrera).
+ALTER TABLE events
+  ADD COLUMN IF NOT EXISTS afc_evidence_file_id BIGINT;
+
+DO $$ BEGIN
+  ALTER TABLE events
+    ADD CONSTRAINT fk_events_afc_evidence_file
+    FOREIGN KEY (afc_evidence_file_id) REFERENCES files(id) ON DELETE SET NULL;
+EXCEPTION WHEN duplicate_object THEN NULL; END $$;
 
 
 -- ----------

@@ -8,8 +8,19 @@ import {
   HOURS_PENDING_ALLOWED_STATUSES,
   normalizeAfcValuationInput,
 } from "../services/eventHoursValuation.js";
+import { eventDayKey } from "../services/eventAttendance.js";
 
 export const MAX_EVENT_HOURS = 100;
+// 6 meses (hasta 184 días) con 3 sesiones por semana: 26 semanas × 3 + 2 días sueltos.
+export const MAX_EVENT_SESSIONS = 80;
+export const MIN_ATTENDANCE_ERROR = "El porcentaje mínimo de asistencia debe ser un entero entre 1 y 100.";
+
+// Valor ausente => 100 (todas las sesiones); inválido => null.
+export function parseMinAttendancePercent(value) {
+  if (value === undefined || value === null || value === "") return 100;
+  const percent = Number(value);
+  return Number.isInteger(percent) && percent >= 1 && percent <= 100 ? percent : null;
+}
 
 export function parseIsoDateOrNull(value) {
   if (value === undefined || value === null || value === "") return null;
@@ -139,10 +150,12 @@ export function normalizeCreateEventPayload(body) {
       ? null
       : parseIsoDateOrNull(body.cancel_deadline);
   const attributes = body?.attributes === undefined ? {} : body.attributes;
+  const minAttendancePercent = parseMinAttendancePercent(body?.min_attendance_percent);
 
   if (!title) return { error: "El título del evento es obligatorio." };
   if (!description) return { error: "La descripción del evento es obligatoria." };
   if (!EVENT_STATUSES.has(status)) return { error: "El estatus seleccionado no es válido." };
+  if (minAttendancePercent === null) return { error: MIN_ATTENDANCE_ERROR };
   if (!HOURS_PENDING_ALLOWED_STATUSES.has(status)) {
     const missing = missingPublishFields({
       title,
@@ -260,6 +273,9 @@ export function normalizeCreateEventPayload(body) {
     if (!Array.isArray(body.sessions) || body.sessions.length === 0) {
       return { error: "Agrega al menos una sesión válida al evento." };
     }
+    if (body.sessions.length > MAX_EVENT_SESSIONS) {
+      return { error: `Se enviaron ${body.sessions.length} sesiones y el evento admite hasta ${MAX_EVENT_SESSIONS}.` };
+    }
 
     for (let i = 0; i < body.sessions.length; i += 1) {
       const session = body.sessions[i];
@@ -308,7 +324,7 @@ export function normalizeCreateEventPayload(body) {
   if (sessions.length > 1) {
     const seenDays = new Set();
     for (let i = 0; i < sessions.length; i += 1) {
-      const dayKey = sessions[i].starts_at.toISOString().slice(0, 10);
+      const dayKey = eventDayKey(sessions[i].starts_at);
       if (seenDays.has(dayKey)) {
         return { error: `No puede haber más de una sesión en el mismo día (${dayKey}).` };
       }
@@ -339,6 +355,7 @@ export function normalizeCreateEventPayload(body) {
       attributes: normalizedAttributes,
       geo,
       sessions,
+      min_attendance_percent: sessions.length > 1 ? minAttendancePercent : 100,
       afc,
       afc_valuation: afc ? afc.valuation : null,
     },

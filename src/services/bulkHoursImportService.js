@@ -16,7 +16,7 @@ import {
   normalizeAdjustmentMotive,
   normalizeManualHours,
 } from "./manualHoursAdjustmentService.js";
-import { capHoursToGoal, goalCapNote, loadUsersHoursProgress } from "./afcHoursGoal.js";
+import { capHoursToGoal, loadUsersHoursProgress } from "./afcHoursGoal.js";
 
 export const HOURS_CSV_HEADERS = Object.freeze(["numero_cuenta", "horas", "motivo"]);
 
@@ -460,7 +460,7 @@ export async function commitBulkHoursImport({ importId, importer, dependencies =
           row.userId,
           credited,
           token.importerUserId,
-          `${row.motive}${goalCapNote(credited, row.hours)}`,
+          row.motive,
           token.category,
           row.requestId,
         ],

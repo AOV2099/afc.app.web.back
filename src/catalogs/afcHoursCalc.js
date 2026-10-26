@@ -55,13 +55,13 @@ export const AFC_INPUT_UNIT = Object.freeze({
   AFC_HOURS: "afc_hours",
 });
 
-// Tope por jornada y después tope total; el total también se limita al máximo de la actividad.
+// Tope por sesión y después tope total; el total también se limita al máximo de la actividad.
 export const AFC_COURSE_RULES = Object.freeze({
   multiplier: 2,
   maxAfcHoursPerDay: 20,
   maxAfcHoursTotal: 150,
   maxEffectiveHoursPerDay: 24,
-  maxDays: 60,
+  maxDays: 80,
 });
 
 export const AFC_MAX_EVENT_HOURS = 200;
@@ -173,13 +173,13 @@ function isValidIsoDate(value) {
   return !Number.isNaN(date.getTime()) && date.toISOString().slice(0, 10) === value;
 }
 
-// Devuelve las jornadas normalizadas y, si están completas, el cálculo por jornada.
+// Devuelve las sesiones normalizadas y, si están completas, el cálculo por sesión.
 export function calculateCourseDurationHours(days, maxTotal = AFC_COURSE_RULES.maxAfcHoursTotal) {
   if (!Array.isArray(days) || days.length === 0) {
     return { ok: true, complete: false, days: [] };
   }
   if (days.length > AFC_COURSE_RULES.maxDays) {
-    return fail("too_many_days", `Registra como máximo ${AFC_COURSE_RULES.maxDays} jornadas.`);
+    return fail("too_many_days", `Hay ${days.length} sesiones y el máximo es ${AFC_COURSE_RULES.maxDays}.`);
   }
 
   const multipleDays = days.length > 1;
@@ -195,15 +195,15 @@ export function calculateCourseDurationHours(days, maxTotal = AFC_COURSE_RULES.m
   for (let index = 0; index < days.length; index += 1) {
     const day = days[index];
     if (!day || typeof day !== "object" || Array.isArray(day)) {
-      return fail("invalid_duration", `La jornada ${index + 1} no tiene un formato válido.`);
+      return fail("invalid_duration", `La sesión ${index + 1} no tiene un formato válido.`);
     }
     const date = isBlank(day.date) ? "" : String(day.date).trim();
     if (date && !isValidIsoDate(date)) {
-      return fail("invalid_duration", `La fecha de la jornada ${index + 1} no es válida.`);
+      return fail("invalid_duration", `La fecha de la sesión ${index + 1} no es válida.`);
     }
     if (date) {
       if (seenDates.has(date)) {
-        return fail("duplicate_day", `La jornada del ${date} está duplicada.`);
+        return fail("duplicate_day", `La sesión del ${date} está duplicada.`);
       }
       seenDates.add(date);
     } else if (multipleDays) {
@@ -217,13 +217,13 @@ export function calculateCourseDurationHours(days, maxTotal = AFC_COURSE_RULES.m
       if (!hours) {
         return fail(
           "invalid_duration",
-          `Las horas efectivas de la jornada ${index + 1} deben ser un número no negativo con hasta dos decimales.`,
+          `Las horas efectivas de la sesión ${index + 1} deben ser un número no negativo con hasta dos decimales.`,
         );
       }
       if (cmpRat(hours, maxEffective) > 0) {
         return fail(
           "invalid_duration",
-          `La jornada ${index + 1} no puede superar ${AFC_COURSE_RULES.maxEffectiveHoursPerDay} horas efectivas.`,
+          `La sesión ${index + 1} no puede superar ${AFC_COURSE_RULES.maxEffectiveHoursPerDay} horas efectivas.`,
         );
       }
       hoursText = ratToDecimalString(hours);
@@ -493,6 +493,7 @@ export function normalizeAfcTypeInput(raw, { partial = false } = {}) {
     min_hours: min.value,
     max_hours: max.value,
     valuation_mode: mode,
+    multi_session: raw.multi_session === true || raw.multi_session === "true",
     sort_order: sortOrder,
     is_active: raw.is_active === undefined ? true : raw.is_active === true || raw.is_active === "true",
   });

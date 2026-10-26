@@ -24,13 +24,25 @@ import {
 } from "../config/appConfig.js";
 import {
   MAX_EVENT_HOURS,
+  MAX_EVENT_SESSIONS,
+  MIN_ATTENDANCE_ERROR,
   missingPublishFields,
   normalizeCreateEventPayload,
   parseIsoDateOrNull,
+  parseMinAttendancePercent,
   parsePlainDecimalOrNull,
   PUBLISH_REQUIRED_FIELDS,
   publishMissingMessage,
 } from "../validators/events.js";
+import {
+  attendanceProgress,
+  eventDayKey,
+  grantsHoursOnCheckin,
+  loadAttendanceReachability,
+  planSessionReschedule,
+  unreachableAttendanceMessage,
+} from "../services/eventAttendance.js";
+import { AFC_METHOD } from "../catalogs/afcHoursCalc.js";
 import {
   assertEventStaffCareer,
   loadEventManagerCareerId,
@@ -40,13 +52,14 @@ import {
   canManageEventCareer,
 } from "../services/eventCareerAccess.js";
 import {
+  assertAfcSessionsSupported,
   assertHoursAllowStatus,
   attachAfcEvidence,
   normalizeAfcValuationInput,
   prepareEventHoursValuation,
 } from "../services/eventHoursValuation.js";
 import { loadFileMetadata } from "../services/fileStorageService.js";
-import { capHoursToGoal, goalCapNote, loadUserHoursProgress } from "../services/afcHoursGoal.js";
+import { capHoursToGoal, loadUserHoursProgress } from "../services/afcHoursGoal.js";
 import { createOAuthRateLimit } from "../middleware/oauthRateLimit.js";
 import { MAX_PAGE, escapeLikePattern, parsePositiveIntParam } from "../utils/requestParams.js";
 
@@ -1048,6 +1061,8 @@ async function listEvents({
        e.status,
        e.registration_mode,
        e.resubmission_policy,
+       e.min_attendance_percent,
+       (SELECT COUNT(*)::int FROM event_sessions es WHERE es.event_id = e.id) AS total_sessions,
        e.allow_self_checkin,
        e.geo_enforced,
        e.cancel_policy,
@@ -1216,7 +1231,8 @@ router.post("/api/events/:eventId/register", requireAuth, async (req, res) => {
     const created = await withTransaction(async (tx) => {
       // FOR UPDATE serializa las inscripciones del evento para que el cupo no se rebase en paralelo.
       const eventResult = await tx.query(
-        `SELECT id, org_id, status, registration_mode, resubmission_policy, ends_at, capacity, capacity_enabled
+        `SELECT id, org_id, status, registration_mode, resubmission_policy, ends_at, capacity, capacity_enabled,
+                min_attendance_percent
          FROM events
          WHERE id = $1 AND org_id = $2
          LIMIT 1
@@ -1235,6 +1251,13 @@ router.post("/api/events/:eventId/register", requireAuth, async (req, res) => {
       const endsAt = new Date(event.ends_at);
       if (Number.isNaN(endsAt.getTime()) || new Date() >= endsAt) {
         throw createHttpError(400, "El evento ya no acepta registros.");
+      }
+      const reachability = await loadAttendanceReachability(tx, {
+        eventId,
+        percent: event.min_attendance_percent,
+      });
+      if (!reachability.reachable) {
+        throw createHttpError(400, unreachableAttendanceMessage(reachability));
       }
 
       const duplicateResult = await tx.query(
@@ -1542,13 +1565,13 @@ router.post("/api/events/:eventId/unregister", requireAuth, async (req, res) => 
         throw createHttpError(404, "No existe inscripción para este evento.");
       }
 
-      // Eventos sin horas AFC (o con la meta ya cumplida) dejan movimientos de 0 hrs; también cuentan como asistencia.
+      // Cualquier sesión asistida cuenta, aunque aún no alcance el mínimo para acreditar horas.
       const attendanceResult = await tx.query(
         `SELECT 1
-         FROM hours_ledger
+         FROM checkins
          WHERE event_id = $1
            AND user_id = $2
-           AND reason = 'checkin'::ledger_reason
+           AND result = 'accepted'::checkin_result
          LIMIT 1`,
         [eventId, userId],
       );
@@ -1756,6 +1779,59 @@ router.get("/api/events/:eventId/registrations-count", requireAuth, async (req, 
   }
 });
 
+// Requiere los alias e (events) y r (registrations).
+const REGISTRATION_ATTENDANCE_COLUMNS_SQL = `
+         e.min_attendance_percent,
+         (SELECT COUNT(*)::int FROM event_sessions es WHERE es.event_id = e.id) AS total_sessions,
+         (SELECT COUNT(DISTINCT c.session_id)::int
+          FROM checkins c
+          WHERE c.event_id = e.id AND c.user_id = r.user_id AND c.result = 'accepted'::checkin_result
+         ) AS attended_sessions,
+         (SELECT COUNT(*)::int
+          FROM event_sessions es
+          WHERE es.event_id = e.id
+            AND es.ends_at >= now()
+            AND NOT EXISTS (
+              SELECT 1 FROM checkins c
+              WHERE c.session_id = es.id AND c.user_id = r.user_id AND c.result = 'accepted'::checkin_result
+            )
+         ) AS pending_sessions,
+         next_session.starts_at AS next_session_starts_at,
+         next_session.ends_at AS next_session_ends_at`;
+
+// Requiere los alias e (events) y r (registrations): siguiente sesión sin terminar y sin asistencia del alumno.
+const NEXT_SESSION_JOIN_SQL = `
+       LEFT JOIN LATERAL (
+         SELECT es.starts_at, es.ends_at
+         FROM event_sessions es
+         WHERE es.event_id = e.id
+           AND es.ends_at >= now()
+           AND NOT EXISTS (
+             SELECT 1 FROM checkins c
+             WHERE c.session_id = es.id AND c.user_id = r.user_id AND c.result = 'accepted'::checkin_result
+           )
+         ORDER BY es.starts_at ASC
+         LIMIT 1
+       ) next_session ON TRUE`;
+
+function mapRegistrationAttendance(row) {
+  const progress = attendanceProgress({
+    attended: row.attended_sessions,
+    total: row.total_sessions,
+    percent: row.min_attendance_percent,
+  });
+  const pending = Number(row.pending_sessions ?? 0);
+  return {
+    ...progress,
+    percent: Number(row.min_attendance_percent ?? 100),
+    pending,
+    reachable: progress.met || progress.attended + pending >= progress.required,
+    next_session: row.next_session_starts_at
+      ? { starts_at: row.next_session_starts_at, ends_at: row.next_session_ends_at }
+      : null,
+  };
+}
+
 router.get("/api/events/:eventId/ticket", requireAuth, async (req, res) => {
   const eventId = Number(req.params.eventId);
   const userId = req.auth?.userId;
@@ -1782,6 +1858,8 @@ router.get("/api/events/:eventId/ticket", requireAuth, async (req, res) => {
          e.location,
          e.organizer,
          e.cover_image_url,
+         e.hours_value,
+         ${REGISTRATION_ATTENDANCE_COLUMNS_SQL},
          t.id AS ticket_id,
          t.ticket_code,
          t.status AS ticket_status,
@@ -1796,6 +1874,7 @@ router.get("/api/events/:eventId/ticket", requireAuth, async (req, res) => {
          ORDER BY issued_at DESC NULLS LAST, id DESC
          LIMIT 1
        ) t ON TRUE
+       ${NEXT_SESSION_JOIN_SQL}
        WHERE r.event_id = $1
          AND r.user_id = $2
          AND e.org_id = $3
@@ -1821,6 +1900,7 @@ router.get("/api/events/:eventId/ticket", requireAuth, async (req, res) => {
             issued_at: registration.issued_at,
             revoked_at: registration.revoked_at,
           };
+    const sessionsByEvent = await loadUserSessionsByEvent({ query }, userId, [eventId]);
 
     return res.status(200).json({
       ok: true,
@@ -1839,7 +1919,10 @@ router.get("/api/events/:eventId/ticket", requireAuth, async (req, res) => {
         location: registration.location,
         organizer: registration.organizer,
         cover_image_url: registration.cover_image_url,
+        hours_value: registration.hours_value === null ? null : Number(registration.hours_value),
       },
+      attendance: mapRegistrationAttendance(registration),
+      sessions: sessionsByEvent.get(String(eventId)) ?? [],
       ticket,
     });
   } catch (err) {
@@ -1888,6 +1971,9 @@ router.get("/api/me/registrations", requireAuth, async (req, res) => {
          e.ends_at,
          e.status AS event_status,
          e.cover_image_url,
+         e.category,
+         e.hours_value,
+         ${REGISTRATION_ATTENDANCE_COLUMNS_SQL},
          t.id AS ticket_id,
          t.ticket_code,
          t.status AS ticket_status,
@@ -1902,12 +1988,19 @@ router.get("/api/me/registrations", requireAuth, async (req, res) => {
          ORDER BY issued_at DESC NULLS LAST, id DESC
          LIMIT 1
        ) t ON TRUE
+       ${NEXT_SESSION_JOIN_SQL}
        WHERE r.user_id = $1
          AND e.org_id = $2
        ORDER BY r.submitted_at DESC
        LIMIT $3
        OFFSET $4`,
       [userId, DEFAULT_ORG_ID, pageSize, offset],
+    );
+
+    const sessionsByEvent = await loadUserSessionsByEvent(
+      { query },
+      userId,
+      listResult.rows.map((row) => row.event_id),
     );
 
     const registrations = listResult.rows.map((row) => ({
@@ -1927,7 +2020,11 @@ router.get("/api/me/registrations", requireAuth, async (req, res) => {
         ends_at: row.ends_at,
         status: row.event_status,
         cover_image_url: row.cover_image_url,
+        category: row.category,
+        hours_value: row.hours_value === null ? null : Number(row.hours_value),
       },
+      attendance: mapRegistrationAttendance(row),
+      sessions: sessionsByEvent.get(String(row.event_id)) ?? [],
       ticket:
         row.ticket_id === null
           ? null
@@ -1956,6 +2053,106 @@ router.get("/api/me/registrations", requireAuth, async (req, res) => {
       ok: false,
       message: "No se pudieron consultar tus inscripciones.",
     });
+  }
+});
+
+// Estado de cada sesión para el alumno: asistida, en curso, próxima o sin asistencia.
+export function sessionAttendanceState({ starts_at, ends_at, checked_in_at }, now = new Date()) {
+  if (checked_in_at) return "attended";
+  if (new Date(ends_at) < now) return "missed";
+  if (new Date(starts_at) <= now) return "in_progress";
+  return "upcoming";
+}
+
+async function loadUserSessionsByEvent(executor, userId, eventIds) {
+  const byEvent = new Map(eventIds.map((id) => [String(id), []]));
+  if (!eventIds.length) return byEvent;
+  const result = await executor.query(
+    `SELECT s.event_id, s.id, s.starts_at, s.ends_at, s.label, c.scanned_at AS checked_in_at
+     FROM event_sessions s
+     LEFT JOIN checkins c
+       ON c.session_id = s.id AND c.user_id = $1 AND c.result = 'accepted'::checkin_result
+     WHERE s.event_id = ANY($2::bigint[])
+     ORDER BY s.starts_at ASC`,
+    [userId, eventIds],
+  );
+  const now = new Date();
+  for (const row of result.rows) {
+    byEvent.get(String(row.event_id))?.push({
+      id: row.id,
+      starts_at: row.starts_at,
+      ends_at: row.ends_at,
+      label: row.label,
+      checked_in_at: row.checked_in_at,
+      state: sessionAttendanceState(row, now),
+    });
+  }
+  return byEvent;
+}
+
+const CALENDAR_REGISTRATION_STATUSES = ["approved", "pending", "changes_requested", "cancel_pending"];
+
+router.get("/api/me/calendar", requireAuth, async (req, res) => {
+  const userId = req.auth?.userId;
+  if (!userId) {
+    return res.status(401).json({ ok: false, message: "Sesión inválida." });
+  }
+
+  try {
+    const listResult = await query(
+      `SELECT
+         r.status::text AS registration_status,
+         e.id AS event_id,
+         e.title,
+         e.description,
+         e.organizer,
+         e.location,
+         e.category,
+         e.starts_at,
+         e.ends_at,
+         e.status::text AS event_status,
+         e.hours_value,
+         e.cover_image_url,
+         ${REGISTRATION_ATTENDANCE_COLUMNS_SQL}
+       FROM registrations r
+       JOIN events e ON e.id = r.event_id
+       ${NEXT_SESSION_JOIN_SQL}
+       WHERE r.user_id = $1
+         AND e.org_id = $2
+         AND r.status::text = ANY($3::text[])
+         AND e.starts_at IS NOT NULL
+       ORDER BY e.starts_at ASC
+       LIMIT 500`,
+      [userId, DEFAULT_ORG_ID, CALENDAR_REGISTRATION_STATUSES],
+    );
+    const sessionsByEvent = await loadUserSessionsByEvent(
+      { query },
+      userId,
+      listResult.rows.map((row) => row.event_id),
+    );
+
+    return res.status(200).json({
+      ok: true,
+      events: listResult.rows.map((row) => ({
+        id: row.event_id,
+        title: row.title,
+        description: row.description,
+        organizer: row.organizer,
+        location: row.location,
+        category: row.category,
+        starts_at: row.starts_at,
+        ends_at: row.ends_at,
+        status: row.event_status,
+        hours_value: row.hours_value === null ? null : Number(row.hours_value),
+        cover_image_url: row.cover_image_url || null,
+        registration_status: row.registration_status,
+        attendance: mapRegistrationAttendance(row),
+        sessions: sessionsByEvent.get(String(row.event_id)) ?? [],
+      })),
+    });
+  } catch (err) {
+    console.error("Error en GET /api/me/calendar:", err.message);
+    return res.status(500).json({ ok: false, message: "No se pudo consultar tu calendario." });
   }
 });
 
@@ -2170,10 +2367,11 @@ router.get(
 
       const [sessionsResult, geoResult, afcEvidence, hasAttendance] = await Promise.all([
         query(
-          `SELECT id, event_id, starts_at, ends_at, label, hours_value, created_at
-           FROM event_sessions
-           WHERE event_id = $1
-           ORDER BY starts_at ASC`,
+          `SELECT s.id, s.event_id, s.starts_at, s.ends_at, s.label, s.hours_value, s.created_at,
+                  EXISTS (SELECT 1 FROM checkins c WHERE c.session_id = s.id) AS has_checkins
+           FROM event_sessions s
+           WHERE s.event_id = $1
+           ORDER BY s.starts_at ASC`,
           [eventId],
         ),
         query(
@@ -2380,6 +2578,7 @@ router.post(
              r.user_id,
              r.status::text AS status,
              r.payload,
+             e.min_attendance_percent,
              owner_user.career_id AS owner_career_id
            FROM registrations r
            JOIN events e ON e.id = r.event_id
@@ -2420,6 +2619,17 @@ router.post(
               registration: deniedResult.rows[0],
               ticket: null,
             };
+          }
+
+          const reachability = await loadAttendanceReachability(tx, {
+            eventId: registration.event_id,
+            percent: registration.min_attendance_percent,
+          });
+          if (!reachability.reachable) {
+            throw createHttpError(
+              409,
+              `${unreachableAttendanceMessage(reachability)} Rechaza la solicitud o reprograma las sesiones.`,
+            );
           }
 
           const updatedResult = await tx.query(
@@ -2969,7 +3179,7 @@ router.post(
 
         const eventResult = await tx.query(
           `SELECT e.id, e.org_id, e.title, e.starts_at, e.ends_at, e.status::text AS status,
-                  e.geo_enforced, e.hours_value, e.attributes,
+                  e.geo_enforced, e.hours_value, e.attributes, e.min_attendance_percent,
                   owner_user.career_id AS owner_career_id
            FROM events e
            LEFT JOIN users owner_user ON owner_user.id = e.created_by
@@ -3065,7 +3275,8 @@ router.post(
           };
         }
 
-        if (ticket.status !== "active") {
+        // "used" solo indica que ya asistió a alguna sesión; sigue siendo válido para las siguientes.
+        if (ticket.status !== "active" && ticket.status !== "used") {
           if (existingCheckin) {
             return {
               result: "cancelled_ticket",
@@ -3251,42 +3462,76 @@ router.post(
             );
 
         const insertedCheckin = checkinResult.rows[0];
+        let attendance = null;
+        let hoursCredited = null;
+        let hoursCapped = false;
 
         if (result === "accepted") {
-          const grantedHours =
-            session.hours_value !== null && session.hours_value !== undefined
-              ? Number(session.hours_value)
-              : Number(event.hours_value);
+          // Bloquear al usuario antes de contar evita que dos check-ins simultáneos acrediten dos veces.
           const progress = await loadUserHoursProgress(tx, ticket.user_id, { lock: true });
-          const creditedHours = capHoursToGoal(
-            Number.isNaN(grantedHours) ? 0 : grantedHours,
-            progress.total,
-            progress.goal,
+          const countsResult = await tx.query(
+            `SELECT
+               (SELECT COUNT(*)::int FROM event_sessions WHERE event_id = $1) AS total,
+               (SELECT COUNT(DISTINCT session_id)::int
+                FROM checkins
+                WHERE event_id = $1 AND user_id = $2 AND result = 'accepted'::checkin_result) AS attended`,
+            [resolvedEventId, ticket.user_id],
           );
-          const capNote = goalCapNote(creditedHours, grantedHours);
+          const totalSessions = Number(countsResult.rows?.[0]?.total ?? 1);
+          const attendedSessions = Number(countsResult.rows?.[0]?.attended ?? 1);
+          attendance = attendanceProgress({
+            attended: attendedSessions,
+            total: totalSessions,
+            percent: event.min_attendance_percent,
+          });
 
-          await tx.query(
-            `INSERT INTO hours_ledger (
-              user_id,
-              event_id,
-              hours_delta,
-              reason,
-              source_checkin_id,
-              created_by,
-              note
-            ) VALUES (
-              $1, $2, $3, 'checkin'::ledger_reason, $4, $5, $6
-            )
-            ON CONFLICT (source_checkin_id) DO NOTHING`,
-            [
-              ticket.user_id,
-              resolvedEventId,
-              creditedHours,
-              insertedCheckin.id,
-              scannerAdminId,
-              `Check-in staff session=${session.id}${capNote}`,
-            ],
-          );
+          if (
+            grantsHoursOnCheckin({
+              attendedAfter: attendedSessions,
+              total: totalSessions,
+              percent: event.min_attendance_percent,
+            })
+          ) {
+            const multiSession = totalSessions > 1;
+            // Con varias sesiones se acreditan las horas totales del evento una sola vez.
+            const grantedHours =
+              !multiSession && session.hours_value !== null && session.hours_value !== undefined
+                ? Number(session.hours_value)
+                : Number(event.hours_value);
+            const creditedHours = capHoursToGoal(
+              Number.isNaN(grantedHours) ? 0 : grantedHours,
+              progress.total,
+              progress.goal,
+            );
+            hoursCapped = creditedHours < grantedHours;
+            const attendanceNote = multiSession
+              ? ` · Asistencia ${attendedSessions} de ${totalSessions} sesiones`
+              : "";
+
+            await tx.query(
+              `INSERT INTO hours_ledger (
+                user_id,
+                event_id,
+                hours_delta,
+                reason,
+                source_checkin_id,
+                created_by,
+                note
+              ) VALUES (
+                $1, $2, $3, 'checkin'::ledger_reason, $4, $5, $6
+              )
+              ON CONFLICT (source_checkin_id) DO NOTHING`,
+              [
+                ticket.user_id,
+                resolvedEventId,
+                creditedHours,
+                insertedCheckin.id,
+                scannerAdminId,
+                `Check-in staff session=${session.id}${attendanceNote}`,
+              ],
+            );
+            hoursCredited = creditedHours;
+          }
 
           await tx.query(
             `UPDATE tickets
@@ -3306,6 +3551,9 @@ router.post(
           ticket_id: ticket.id,
           event_id: resolvedEventId,
           session_id: session.id,
+          attendance,
+          hours_credited: hoursCredited,
+          hours_capped: hoursCapped,
         };
       });
 
@@ -3359,6 +3607,9 @@ router.post(
         checkin: scan.checkin,
         user_id: scan.user_id ?? null,
         ticket_id: scan.ticket_id ?? null,
+        attendance: scan.attendance ?? null,
+        hours_credited: scan.hours_credited ?? null,
+        hours_capped: Boolean(scan.hours_capped),
       });
     } catch (err) {
       if ([400, 403, 409, 422].includes(err?.statusCode)) {
@@ -3370,6 +3621,15 @@ router.post(
       }
       if (err?.statusCode === 404) {
         return res.status(404).json({ ok: false, message: err.message });
+      }
+      // Dos escaneos simultáneos del mismo QR: la restricción UNIQUE (session_id, user_id) deja pasar solo uno.
+      if (err?.code === "23505" && String(err?.constraint || "").startsWith("checkins_")) {
+        return res.status(409).json({
+          ok: true,
+          code: "TICKET_ALREADY_SCANNED",
+          result: "duplicate",
+          reason: "El usuario ya tiene check-in para esta sesión.",
+        });
       }
 
       console.error("Error en POST /api/admin/events/:eventId/checkins/scan:", err.message);
@@ -3386,11 +3646,19 @@ async function prepareCreatedEventValuation(tx, eventInput) {
     assertHoursAllowStatus(eventInput.hours_value, eventInput.status);
     return;
   }
-  const prepared = await prepareEventHoursValuation(tx, { existing: null, input: eventInput.afc });
+  const prepared = await prepareEventHoursValuation(tx, {
+    existing: null,
+    input: eventInput.afc,
+    sessions: eventInput.sessions ?? [],
+  });
   assertHoursAllowStatus(prepared.hoursValue, eventInput.status);
   eventInput.hours_value = prepared.hoursValue;
   eventInput.afc_valuation = prepared.valuation;
   eventInput.afc_evidence_file_id = prepared.evidenceFileId;
+  await assertAfcSessionsSupported(tx, {
+    valuation: prepared.valuation,
+    sessionCount: eventInput.sessions?.length ?? 0,
+  });
 }
 
 async function applyCreatedEventEvidence(tx, eventRow, eventInput, authUserId) {
@@ -3415,11 +3683,11 @@ async function createEventRecords(tx, eventInput, rawBody, authUserId, managerCa
       org_id, title, description, category, location, organizer, starts_at, ends_at,
       hours_value, capacity, capacity_enabled, status, registration_mode,
       resubmission_policy, allow_self_checkin, geo_enforced, cancel_policy,
-      cancel_deadline, cover_image_url, attributes, created_by, afc_valuation
+      cancel_deadline, cover_image_url, attributes, created_by, afc_valuation, min_attendance_percent
     ) VALUES (
       $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12::event_status,
       $13::registration_mode, $14::resubmission_policy, $15, $16,
-      $17::cancel_policy, $18, $19, $20::jsonb, $21, $22::jsonb
+      $17::cancel_policy, $18, $19, $20::jsonb, $21, $22::jsonb, $23
     ) RETURNING *`,
     [
       DEFAULT_ORG_ID, eventInput.title, eventInput.description, category,
@@ -3429,6 +3697,7 @@ async function createEventRecords(tx, eventInput, rawBody, authUserId, managerCa
       eventInput.geo_enforced, eventInput.cancel_policy, eventInput.cancel_deadline,
       eventInput.cover_image_url, JSON.stringify(eventInput.attributes), authUserId,
       eventInput.afc_valuation ? JSON.stringify(eventInput.afc_valuation) : null,
+      eventInput.min_attendance_percent ?? 100,
     ],
   );
   const eventRow = eventInsertResult.rows[0];
@@ -3619,10 +3888,11 @@ router.post("/api/admin/events", requireAuth, requireEventManager, async (req, r
           cover_image_url,
           attributes,
           created_by,
-          afc_valuation
+          afc_valuation,
+          min_attendance_percent
         ) VALUES (
           $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12::event_status, $13::registration_mode,
-          $14::resubmission_policy, $15, $16, $17::cancel_policy, $18, $19, $20::jsonb, $21, $22::jsonb
+          $14::resubmission_policy, $15, $16, $17::cancel_policy, $18, $19, $20::jsonb, $21, $22::jsonb, $23
         )
         RETURNING *`,
         [
@@ -3648,6 +3918,7 @@ router.post("/api/admin/events", requireAuth, requireEventManager, async (req, r
           JSON.stringify(eventInput.attributes),
           authUserId,
           eventInput.afc_valuation ? JSON.stringify(eventInput.afc_valuation) : null,
+          eventInput.min_attendance_percent ?? 100,
         ],
       );
 
@@ -3906,7 +4177,9 @@ export function assertAttendanceLockedFields(existingEvent, updates) {
   const dateChanged = (field) =>
     updates[field] !== undefined &&
     parseIsoDateOrNull(updates[field])?.getTime() !== new Date(existingEvent[field]).getTime();
-  if (dateChanged("starts_at") || dateChanged("ends_at")) {
+  // Con sesiones, las fechas salen de ellas y la reprogramación se valida sesión por sesión.
+  const sessionsDriven = Array.isArray(updates.sessions) && updates.sessions.length > 0;
+  if (!sessionsDriven && (dateChanged("starts_at") || dateChanged("ends_at"))) {
     throw createHttpError(409, `${prefix}: no se pueden cambiar sus fechas.`);
   }
 
@@ -3915,6 +4188,12 @@ export function assertAttendanceLockedFields(existingEvent, updates) {
     updates.hours_value !== undefined && parsePlainDecimalOrNull(updates.hours_value) !== previousHours;
   const disablesAfc =
     isAfcHoursDisabled(updates) && (Boolean(existingEvent.afc_valuation) || previousHours !== 0);
+  const attendanceRuleChanged =
+    updates.min_attendance_percent !== undefined &&
+    parseMinAttendancePercent(updates.min_attendance_percent) !== Number(existingEvent.min_attendance_percent ?? 100);
+  if (attendanceRuleChanged) {
+    throw createHttpError(409, `${prefix}: no se puede cambiar el porcentaje mínimo de asistencia.`);
+  }
   if ((updates.afc_valuation !== undefined && updates.afc_valuation !== null) || hoursChanged || disablesAfc) {
     throw createHttpError(
       409,
@@ -3928,6 +4207,32 @@ export function assertAttendanceLockedFields(existingEvent, updates) {
       throw createHttpError(409, `${prefix}: solo puede marcarse como finalizado o cancelado.`);
     }
   }
+}
+
+// Rango (primera y última sesión) de las sesiones enviadas; null si faltan o alguna es inválida.
+export function rangeFromSessions(sessions) {
+  if (!Array.isArray(sessions) || !sessions.length) return null;
+  let startsAt = null;
+  let endsAt = null;
+  for (const session of sessions) {
+    const start = parseIsoDateOrNull(session?.starts_at);
+    const end = parseIsoDateOrNull(session?.ends_at);
+    if (!start || !end) return null;
+    if (!startsAt || start < startsAt) startsAt = start;
+    if (!endsAt || end > endsAt) endsAt = end;
+  }
+  return { startsAt, endsAt };
+}
+
+// Sesiones con las que quedará el evento, para calcular las horas de cursos antes de guardarlas.
+async function resolveValuationSessions(tx, eventId, updates, startsAt, endsAt) {
+  if (Array.isArray(updates.sessions) && updates.sessions.length) return updates.sessions;
+  const stored = await tx.query(
+    `SELECT starts_at, ends_at FROM event_sessions WHERE event_id = $1 ORDER BY starts_at ASC`,
+    [eventId],
+  );
+  if (stored.rows.length > 1) return stored.rows;
+  return startsAt && endsAt ? [{ starts_at: startsAt, ends_at: endsAt }] : [];
 }
 
 router.put("/api/admin/events/:eventId", requireAuth, requireAdmin, async (req, res) => {
@@ -3965,7 +4270,14 @@ router.put("/api/admin/events/:eventId", requireAuth, requireAdmin, async (req, 
         throw notFoundError;
       }
       assertEventCareerAccess(req.auth.careerId, existingEvent.owner_career_id);
-      if (await eventHasAttendance(tx, eventId)) {
+      // Con sesiones, las fechas del evento son siempre la primera y la última sesión.
+      const sessionsRange = rangeFromSessions(updates.sessions);
+      if (sessionsRange) {
+        updates.starts_at = sessionsRange.startsAt.toISOString();
+        updates.ends_at = sessionsRange.endsAt.toISOString();
+      }
+      const hasAttendance = await eventHasAttendance(tx, eventId);
+      if (hasAttendance) {
         assertAttendanceLockedFields(existingEvent, updates);
       }
 
@@ -3980,15 +4292,22 @@ router.put("/api/admin/events/:eventId", requireAuth, requireAdmin, async (req, 
       };
       const startsAt = readDateUpdate("starts_at");
       const endsAt = readDateUpdate("ends_at");
+      const minAttendancePercent =
+        updates.min_attendance_percent !== undefined
+          ? parseMinAttendancePercent(updates.min_attendance_percent)
+          : Number(existingEvent.min_attendance_percent ?? 100);
+      if (minAttendancePercent === null) throw createHttpError(400, MIN_ATTENDANCE_ERROR);
 
       if (Boolean(startsAt) !== Boolean(endsAt)) {
         throw createHttpError(400, "Captura la fecha y hora de inicio y también las de fin.");
       }
       const now = new Date();
-      if (updates.starts_at !== undefined && startsAt && startsAt < now) {
+      const unchanged = (value, field) =>
+        Boolean(value && existingEvent[field]) && value.getTime() === new Date(existingEvent[field]).getTime();
+      if (updates.starts_at !== undefined && startsAt && startsAt < now && !unchanged(startsAt, "starts_at")) {
         throw createHttpError(400, "La fecha y hora de inicio no pueden estar en el pasado.");
       }
-      if (updates.ends_at !== undefined && endsAt && endsAt < now) {
+      if (updates.ends_at !== undefined && endsAt && endsAt < now && !unchanged(endsAt, "ends_at")) {
         throw createHttpError(400, "La fecha y hora de fin no pueden estar en el pasado.");
       }
       if (startsAt && endsAt <= startsAt) {
@@ -4004,6 +4323,27 @@ router.put("/api/admin/events/:eventId", requireAuth, requireAdmin, async (req, 
         if (normalizedAfc.error) throw createHttpError(400, normalizedAfc.error);
         afcInput = normalizedAfc.value;
       }
+      const scheduleChanged =
+        updates.sessions !== undefined || updates.starts_at !== undefined || updates.ends_at !== undefined;
+      const previousValuation = existingEvent.afc_valuation;
+      // Las horas de un curso dependen del horario: si éste cambia, se recalculan con la misma selección.
+      // Con asistencias las horas quedan fijas (solo se corrigen con ajuste manual).
+      if (
+        !hasAttendance &&
+        !afcInput &&
+        !afcHoursDisabled &&
+        scheduleChanged &&
+        previousValuation?.method === AFC_METHOD.COURSE_DURATION
+      ) {
+        afcInput = {
+          origin: previousValuation.origin,
+          typeKey: previousValuation.type_key,
+          scenarioKey: previousValuation.scenario_key,
+          courseDays: null,
+          manualHours: null,
+          evidenceFileId: null,
+        };
+      }
       const isAfcManaged = !afcHoursDisabled && Boolean(afcInput || existingEvent.afc_valuation);
 
       let hoursValue;
@@ -4014,7 +4354,11 @@ router.put("/api/admin/events/:eventId", requireAuth, requireAdmin, async (req, 
         afcValuation = null;
         afcEvidenceFileId = null;
       } else if (afcInput) {
-        const prepared = await prepareEventHoursValuation(tx, { existing: existingEvent, input: afcInput });
+        const prepared = await prepareEventHoursValuation(tx, {
+          existing: existingEvent,
+          input: afcInput,
+          sessions: await resolveValuationSessions(tx, eventId, updates, startsAt, endsAt),
+        });
         if (prepared.evidenceFileId) {
           await attachAfcEvidence(tx, {
             eventId,
@@ -4432,6 +4776,12 @@ router.put("/api/admin/events/:eventId", requireAuth, requireAdmin, async (req, 
           validationError.statusCode = 400;
           throw validationError;
         }
+        if (updates.sessions.length > MAX_EVENT_SESSIONS) {
+          throw createHttpError(
+            400,
+            `Se enviaron ${updates.sessions.length} sesiones y el evento admite hasta ${MAX_EVENT_SESSIONS}.`,
+          );
+        }
 
         const normalizedSessions = [];
         const seenDays = new Set();
@@ -4491,7 +4841,7 @@ router.put("/api/admin/events/:eventId", requireAuth, requireAdmin, async (req, 
             hours_value: sessionHoursValue,
           });
 
-          const dayKey = sessionStartsAt.toISOString().slice(0, 10);
+          const dayKey = eventDayKey(sessionStartsAt);
           if (seenDays.has(dayKey)) {
             const validationError = new Error(
               `No puede haber más de una sesión en el mismo día (${dayKey}).`,
@@ -4502,7 +4852,7 @@ router.put("/api/admin/events/:eventId", requireAuth, requireAdmin, async (req, 
           seenDays.add(dayKey);
         }
 
-        // Borrar event_sessions elimina en cascada los check-ins: con check-ins solo se actualiza la etiqueta.
+        // Borrar event_sessions elimina en cascada los check-ins: con check-ins solo se reprograman las sesiones sin asistencias.
         const existingSessionsResult = await tx.query(
           `SELECT s.id, s.starts_at, s.ends_at, s.hours_value,
                   EXISTS (SELECT 1 FROM checkins c WHERE c.session_id = s.id) AS has_checkins
@@ -4515,27 +4865,12 @@ router.put("/api/admin/events/:eventId", requireAuth, requireAdmin, async (req, 
         const eventHasCheckins = existingSessions.some((row) => row.has_checkins);
 
         if (eventHasCheckins) {
-          const sortedNext = [...normalizedSessions].sort((a, b) => a.starts_at - b.starts_at);
-          const toHours = (value) => (value === null || value === undefined ? null : Number(value));
-          const sameSchedule =
-            sortedNext.length === existingSessions.length &&
-            sortedNext.every(
-              (session, index) =>
-                session.starts_at.getTime() === new Date(existingSessions[index].starts_at).getTime() &&
-                session.ends_at.getTime() === new Date(existingSessions[index].ends_at).getTime() &&
-                toHours(session.hours_value) === toHours(existingSessions[index].hours_value),
-            );
-          if (!sameSchedule) {
-            const conflictError = new Error(
-              "El evento ya tiene asistencias registradas: no se pueden agregar, quitar ni cambiar las fechas u horas de sus sesiones.",
-            );
-            conflictError.statusCode = 409;
-            throw conflictError;
-          }
-          for (let i = 0; i < sortedNext.length; i += 1) {
+          const plan = planSessionReschedule(existingSessions, normalizedSessions);
+          if (plan.error) throw createHttpError(409, plan.error);
+          for (const session of plan.updates) {
             await tx.query(
-              `UPDATE event_sessions SET label = $2 WHERE id = $1`,
-              [existingSessions[i].id, sortedNext[i].label],
+              `UPDATE event_sessions SET starts_at = $2, ends_at = $3, label = $4 WHERE id = $1`,
+              [session.id, session.starts_at, session.ends_at, session.label],
             );
           }
         } else {
@@ -4574,6 +4909,12 @@ router.put("/api/admin/events/:eventId", requireAuth, requireAdmin, async (req, 
         );
         sessionsResult.rows.push(fallbackSession.rows[0]);
       }
+
+      await assertAfcSessionsSupported(tx, { valuation: afcValuation, sessionCount: sessionsResult.rows.length });
+      await tx.query(`UPDATE events SET min_attendance_percent = $2 WHERE id = $1`, [
+        eventId,
+        sessionsResult.rows.length > 1 ? minAttendancePercent : 100,
+      ]);
 
       const eventResult = await tx.query(
         `SELECT * FROM events WHERE id = $1 AND org_id = $2 LIMIT 1`,

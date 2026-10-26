@@ -1,7 +1,7 @@
 import { AFC_KEY_PATTERN } from "../catalogs/afcHoursCalc.js";
 
 const TYPE_COLUMNS = `t.id, t.origin, t.key, t.name, t.description, t.requirements,
-  t.min_hours::text AS min_hours, t.max_hours::text AS max_hours, t.valuation_mode,
+  t.min_hours::text AS min_hours, t.max_hours::text AS max_hours, t.valuation_mode, t.multi_session,
   t.sort_order, t.is_active, t.updated_at`;
 const SCENARIO_COLUMNS = `s.id, s.activity_type_id, s.key, s.label, s.kind,
   s.percent::text AS percent, s.fixed_hours::text AS fixed_hours,

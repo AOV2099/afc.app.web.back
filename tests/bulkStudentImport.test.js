@@ -11,9 +11,9 @@ import {
 } from "../src/services/bulkStudentImportService.js";
 
 const VALID_CSV = [
-  "nombres,apellidos,correo,numero_cuenta",
-  '"Ana   María","Pérez, López",ALUMNA@EXAMPLE.COM,123456789',
-  "Luis,Ruiz,luis@example.com,987654321",
+  "nombres,apellidos,correo,numero_cuenta,sistema",
+  '"Ana   María","Pérez, López",ALUMNA@EXAMPLE.COM,123456789,ESC',
+  "Luis,Ruiz,luis@example.com,987654321,sua",
 ].join("\r\n");
 
 class FakeRedis {
@@ -65,12 +65,29 @@ test("parses BOM and RFC 4180 quoted commas while normalizing fields", () => {
     lastName: "Pérez, López",
     email: "alumna@example.com",
     studentId: "123456789",
+    studySystem: "esc",
   });
+  assert.equal(result.rows[1].studySystem, "sua");
+});
+
+test("sistema es obligatorio y solo acepta ESC o SUA", () => {
+  const result = parseAndValidateStudentCsv([
+    "nombres,apellidos,correo,numero_cuenta,sistema",
+    "Ana,Ruiz,ana@example.com,123456789,",
+    "Luis,Ruiz,luis@example.com,987654321,mixto",
+  ].join("\n"));
+  assert.deepEqual(
+    result.errors.filter((error) => error.field === "sistema").map((error) => [error.row, error.code]),
+    [[2, "required"], [3, "invalid_study_system"]],
+  );
+
+  const legacy = parseAndValidateStudentCsv("nombres,apellidos,correo,numero_cuenta\nAna,Ruiz,ana@example.com,123456789");
+  assert.ok(legacy.errors.some((error) => error.code === "missing_header" && error.field === "sistema"));
 });
 
 test("rejects exact headers without data rows after skipping empty lines", () => {
   const result = parseAndValidateStudentCsv(
-    "\uFEFFnombres,apellidos,correo,numero_cuenta\r\n\r\n\r\n",
+    "\uFEFFnombres,apellidos,correo,numero_cuenta,sistema\r\n\r\n\r\n",
   );
 
   assert.deepEqual(result, {
@@ -86,16 +103,16 @@ test("rejects exact headers without data rows after skipping empty lines", () =>
 
 test("rejects wrong headers, formulas, controls, invalid accounts, and CSV duplicates", () => {
   const wrongHeaders = parseAndValidateStudentCsv(
-    "nombres,apellidos,correo,extra\nAna,Ruiz,a@example.com,123456789",
+    "nombres,apellidos,correo,extra,sistema\nAna,Ruiz,a@example.com,123456789,esc",
   );
   assert.ok(wrongHeaders.errors.some((error) => error.code === "missing_header"));
   assert.ok(wrongHeaders.errors.some((error) => error.code === "unexpected_header"));
 
   const invalid = parseAndValidateStudentCsv([
-    "nombres,apellidos,correo,numero_cuenta",
-    "=CMD(),Ruiz,INVALID,123",
-    '"Ana\tMaría",Ruiz,duplicado@example.com,123456789',
-    "Otra,Persona,DUPLICADO@example.com,123456789",
+    "nombres,apellidos,correo,numero_cuenta,sistema",
+    "=CMD(),Ruiz,INVALID,123,esc",
+    '"Ana\tMaría",Ruiz,duplicado@example.com,123456789,esc',
+    "Otra,Persona,DUPLICADO@example.com,123456789,sua",
   ].join("\n"));
   const codes = new Set(invalid.errors.map((error) => error.code));
   assert.ok(codes.has("formula_not_allowed"));
@@ -186,7 +203,7 @@ test("preview performs reads only and stores every normalized parsed row under a
   assert.equal(redis.setCalls[0].options.EX, 600);
   assert.equal(redis.setCalls[0].key.includes(result.import_id), false);
   const stored = JSON.parse(redis.setCalls[0].value);
-  assert.equal(stored.version, 2);
+  assert.equal(stored.version, 3);
   assert.equal(stored.rows.length, 2);
   assert.equal(stored.rows[0].email, "alumna@example.com");
   assert.equal(stored.rows[1].email, "luis@example.com");
@@ -276,6 +293,7 @@ test("commit skips a new exact duplicate and creates remaining students with one
   assert.equal(insertedParams[0], "luis@example.com");
   assert.equal(insertedParams[1], "one-unknown-batch-hash");
   assert.equal(membershipParams[2], "student");
+  assert.equal(membershipParams[3], "sua");
   const attributes = JSON.parse(insertedParams[6]);
   assert.equal(attributes.provisioned_via, "csv_bulk");
   assert.equal(attributes.imported_by_user_id, "7");

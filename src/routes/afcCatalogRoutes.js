@@ -72,12 +72,13 @@ router.post("/api/admin/afc-catalog/types", requireAuth, requireAdmin, requireGl
     const result = await query(
       `INSERT INTO afc_activity_types (
          origin, key, name, description, requirements, min_hours, max_hours,
-         valuation_mode, sort_order, is_active, updated_by
-       ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+         valuation_mode, sort_order, is_active, updated_by, multi_session
+       ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
        RETURNING id`,
       [
         type.origin, type.key, type.name, type.description, type.requirements, type.min_hours,
         type.max_hours, type.valuation_mode, type.sort_order, type.is_active, req.auth.userId,
+        type.multi_session,
       ],
     );
     const created = await loadAfcTypeById({ query }, result.rows[0].id);
@@ -104,11 +105,13 @@ router.put("/api/admin/afc-catalog/types/:typeId", requireAuth, requireAdmin, re
       await tx.query(
         `UPDATE afc_activity_types
          SET name = $2, description = $3, requirements = $4, min_hours = $5, max_hours = $6,
-             valuation_mode = $7, sort_order = $8, is_active = $9, updated_by = $10, updated_at = now()
+             valuation_mode = $7, sort_order = $8, is_active = $9, updated_by = $10, updated_at = now(),
+             multi_session = $11
          WHERE id = $1`,
         [
           typeId, changes.name, changes.description, changes.requirements, changes.min_hours,
           changes.max_hours, changes.valuation_mode, changes.sort_order, changes.is_active, req.auth.userId,
+          changes.multi_session,
         ],
       );
       const type = await loadAfcTypeById(tx, typeId);

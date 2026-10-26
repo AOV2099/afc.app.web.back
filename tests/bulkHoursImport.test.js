@@ -76,12 +76,13 @@ test("preview validates database targets and stores an opaque one-use token", as
         if (sql.includes("event_categories")) {
           return { rows: [{ key: "culturales" }] };
         }
+        if (sql.includes("unnest(")) return { rows: [] };
         throw new Error("Consulta inesperada");
       },
     },
   });
   assert.equal(result.ok, true);
-  assert.deepEqual(result.summary, { rows: 2, users: 2, total_hours: 3.5 });
+  assert.deepEqual(result.summary, { rows: 2, users: 2, total_hours: 3.5, credited_hours: 3.5, capped_rows: 0 });
   assert.equal(statements.every((sql) => /^\s*SELECT/iu.test(sql)), true);
   const storedKey = [...redis.values.keys()][0];
   assert.equal(storedKey.includes(result.import_id), false);
@@ -141,6 +142,7 @@ test("commit consumes the token and inserts all adjustments atomically", async (
           { id: "22", student_id: "12345678", career_id: 3, status: "active" },
         ] };
         if (sql.includes("event_categories")) return { rows: [{ key: "culturales" }] };
+        if (sql.includes("unnest(")) return { rows: [] };
         throw new Error("Consulta inesperada");
       },
     },
@@ -154,6 +156,9 @@ test("commit consumes the token and inserts all adjustments atomically", async (
         { id: "22", student_id: "12345678", career_id: 3, status: "active" },
       ] };
       if (sql.includes("event_categories")) return { rows: [{ key: "culturales" }] };
+      if (sql.includes("unnest(")) {
+        return { rows: [{ user_id: "21", goal: "240.00", total: "239.00" }, { user_id: "22", goal: "480.00", total: "0" }] };
+      }
       if (sql.includes("INSERT INTO hours_ledger")) {
         inserts.push(params);
         return { rows: [{ id: String(inserts.length) }] };
@@ -166,8 +171,10 @@ test("commit consumes the token and inserts all adjustments atomically", async (
     importer: { userId: "7", role: "admin", careerId: 3 },
     dependencies: { getRedisClientFn: () => redis, withTransactionFn: async (work) => work(tx) },
   });
-  assert.deepEqual(result, { ok: true, adjusted: 2, users: 2, total_hours: 3.5 });
+  assert.deepEqual(result, { ok: true, adjusted: 2, users: 2, total_hours: 2, capped_rows: 1 });
   assert.equal(inserts.length, 2);
+  assert.deepEqual(inserts.map((params) => params[1]), [1, 1], "la cuenta 21 solo puede sumar 1 h hasta su meta de 240");
+  assert.doesNotMatch(inserts[0][3], /Se han agregado/u, "las horas parciales no llevan leyenda");
   assert.equal(inserts.every((params) => params[4] === "culturales"), true);
   await assert.rejects(
     commitBulkHoursImport({

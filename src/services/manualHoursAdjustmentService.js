@@ -1,10 +1,10 @@
-import { DEFAULT_ORG_ID, ROLES } from "../config/appConfig.js";
+import { DEFAULT_ORG_ID, HOURS_LEDGER_MAX_DELTA, HOURS_UPLOAD_MAX_CAREER_ADMIN, ROLES } from "../config/appConfig.js";
 import { withTransaction } from "../postgresClient.js";
-import { assertTargetCareerAccess } from "./adminUserCareerScope.js";
+import { assertTargetCareerAccess, maxHoursPerUpload } from "./adminUserCareerScope.js";
 import { capHoursToGoal, GOAL_CAP_NOTE_SEPARATOR, goalCapNote, loadUserHoursProgress } from "./afcHoursGoal.js";
 
 const ACCOUNT_NUMBER_PATTERN = /^\d{8,10}$/u;
-const HOURS_PATTERN = /^\d{1,3}(?:\.\d{1,2})?$/u;
+const HOURS_PATTERN = /^\d{1,4}(?:\.\d{1,2})?$/u;
 const CATEGORY_PATTERN = /^[a-z][a-z0-9_]{0,49}$/u;
 const REQUEST_ID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/iu;
 const DISALLOWED_NOTE_CONTROLS = /[\u0000-\u0008\u000B\u000C\u000E-\u001F\u007F]/u;
@@ -23,12 +23,16 @@ export function normalizeAccountNumber(value) {
   return ACCOUNT_NUMBER_PATTERN.test(accountNumber) ? accountNumber : null;
 }
 
-export function normalizeManualHours(value) {
+export function effectiveHoursLimit(maxHours) {
+  return maxHours ?? HOURS_LEDGER_MAX_DELTA;
+}
+
+export function normalizeManualHours(value, maxHours = HOURS_UPLOAD_MAX_CAREER_ADMIN) {
   const text = String(value ?? "").trim();
   if (!HOURS_PATTERN.test(text)) return null;
 
   const hours = Number(text);
-  return Number.isFinite(hours) && hours > 0 && hours <= 100 ? hours : null;
+  return Number.isFinite(hours) && hours > 0 && hours <= effectiveHoursLimit(maxHours) ? hours : null;
 }
 
 export function normalizeAdjustmentCategory(value) {
@@ -53,8 +57,9 @@ export async function addManualAccountHours(
   { accountNumber, hours, category, motive, requestId, admin },
   { withTransactionFn = withTransaction } = {},
 ) {
+  const maxHours = maxHoursPerUpload(admin);
   const normalizedAccountNumber = normalizeAccountNumber(accountNumber);
-  const normalizedHours = normalizeManualHours(hours);
+  const normalizedHours = normalizeManualHours(hours, maxHours);
   const normalizedCategory = normalizeAdjustmentCategory(category);
   const normalizedMotive = normalizeAdjustmentMotive(motive);
   const normalizedRequestId = normalizeAdjustmentRequestId(requestId);
@@ -70,7 +75,7 @@ export async function addManualAccountHours(
     throw new ManualHoursAdjustmentError(
       400,
       "invalid_hours",
-      "Las horas deben ser mayores a 0, no exceder 100 y tener máximo 2 decimales.",
+      `Las horas deben ser mayores a 0, no exceder ${effectiveHoursLimit(maxHours)} y tener máximo 2 decimales.`,
     );
   }
   if (!normalizedCategory) {

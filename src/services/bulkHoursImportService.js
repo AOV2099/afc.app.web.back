@@ -5,12 +5,14 @@ import {
   BULK_STUDENT_IMPORT_MAX_ROWS,
   BULK_STUDENT_IMPORT_PREVIEW_TTL_SECONDS,
   DEFAULT_ORG_ID,
+  HOURS_UPLOAD_MAX_CAREER_ADMIN,
   ROLES,
 } from "../config/appConfig.js";
 import { query, withTransaction } from "../postgresClient.js";
 import { getRedisClient } from "../redisClient.js";
-import { assertTargetCareerAccess, normalizeCareerId } from "./adminUserCareerScope.js";
+import { assertTargetCareerAccess, maxHoursPerUpload, normalizeCareerId } from "./adminUserCareerScope.js";
 import {
+  effectiveHoursLimit,
   normalizeAccountNumber,
   normalizeAdjustmentCategory,
   normalizeAdjustmentMotive,
@@ -85,7 +87,7 @@ function validateSafeValue(value, row, field, errors) {
 
 export function parseAndValidateHoursCsv(
   csvText,
-  { maxRows = BULK_STUDENT_IMPORT_MAX_ROWS } = {},
+  { maxRows = BULK_STUDENT_IMPORT_MAX_ROWS, maxHours = HOURS_UPLOAD_MAX_CAREER_ADMIN } = {},
 ) {
   let records;
   try {
@@ -151,7 +153,7 @@ export function parseAndValidateHoursCsv(
     validateSafeValue(rawMotive, rowNumber, "motivo", errors);
 
     const accountNumber = normalizeAccountNumber(rawAccount);
-    const hours = normalizeManualHours(rawHours);
+    const hours = normalizeManualHours(rawHours, maxHours);
     const motive = normalizeAdjustmentMotive(rawMotive);
 
     if (!accountNumber) {
@@ -170,7 +172,7 @@ export function parseAndValidateHoursCsv(
           rowNumber,
           "horas",
           "invalid_hours",
-          "horas debe ser mayor a 0, no exceder 100 y tener máximo 2 decimales.",
+          `horas debe ser mayor a 0, no exceder ${effectiveHoursLimit(maxHours)} y tener máximo 2 decimales.`,
         ),
       );
     }
@@ -291,7 +293,7 @@ export async function previewBulkHoursImport({ csvText, category, importer, depe
     throw new BulkHoursImportError(400, "invalid_category", "Selecciona una categoría válida.");
   }
 
-  const parsed = parseAndValidateHoursCsv(csvText);
+  const parsed = parseAndValidateHoursCsv(csvText, { maxHours: maxHoursPerUpload(importer) });
   if (parsed.errors.length > 0) {
     throw new BulkHoursImportError(422, "csv_validation_failed", "El CSV contiene errores.", parsed.errors);
   }

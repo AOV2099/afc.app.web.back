@@ -1,4 +1,8 @@
-import { ROLES } from "../config/appConfig.js";
+import {
+  HOURS_UPLOAD_MAX_CAREER_ADMIN,
+  HOURS_UPLOAD_MAX_GLOBAL_ADMIN,
+  ROLES,
+} from "../config/appConfig.js";
 
 export class AdminUserCareerScopeError extends Error {
   constructor(statusCode, code, message) {
@@ -19,6 +23,11 @@ export function normalizeCareerId(value) {
 
 export function isGlobalCareerAdmin(auth) {
   return auth?.role === ROLES.ADMIN && normalizeCareerId(auth?.careerId) === 1;
+}
+
+// null = sin límite propio (solo aplica HOURS_LEDGER_MAX_DELTA).
+export function maxHoursPerUpload(auth) {
+  return isGlobalCareerAdmin(auth) ? HOURS_UPLOAD_MAX_GLOBAL_ADMIN : HOURS_UPLOAD_MAX_CAREER_ADMIN;
 }
 
 export function assertAdminRoleAssignmentAccess(auth, roleValue) {

@@ -1055,7 +1055,7 @@ async function listEvents({
        e.starts_at,
        e.ends_at,
        e.hours_value,
-       e.cover_image_url,
+       ${EVENT_COVER_SQL},
        e.capacity,
        e.capacity_enabled,
        e.status,
@@ -1779,6 +1779,9 @@ router.get("/api/events/:eventId/registrations-count", requireAuth, async (req, 
   }
 });
 
+// Eventos antiguos guardaron la portada solo en attributes.cover_image_url.
+const EVENT_COVER_SQL = `COALESCE(NULLIF(e.cover_image_url, ''), NULLIF(e.attributes->>'cover_image_url', '')) AS cover_image_url`;
+
 // Requiere los alias e (events) y r (registrations).
 const REGISTRATION_ATTENDANCE_COLUMNS_SQL = `
          e.min_attendance_percent,
@@ -1857,7 +1860,7 @@ router.get("/api/events/:eventId/ticket", requireAuth, async (req, res) => {
          e.ends_at,
          e.location,
          e.organizer,
-         e.cover_image_url,
+         ${EVENT_COVER_SQL},
          e.hours_value,
          ${REGISTRATION_ATTENDANCE_COLUMNS_SQL},
          t.id AS ticket_id,
@@ -1970,7 +1973,7 @@ router.get("/api/me/registrations", requireAuth, async (req, res) => {
          e.starts_at,
          e.ends_at,
          e.status AS event_status,
-         e.cover_image_url,
+         ${EVENT_COVER_SQL},
          e.category,
          e.hours_value,
          ${REGISTRATION_ATTENDANCE_COLUMNS_SQL},
@@ -2112,7 +2115,7 @@ router.get("/api/me/calendar", requireAuth, async (req, res) => {
          e.ends_at,
          e.status::text AS event_status,
          e.hours_value,
-         e.cover_image_url,
+         ${EVENT_COVER_SQL},
          ${REGISTRATION_ATTENDANCE_COLUMNS_SQL}
        FROM registrations r
        JOIN events e ON e.id = r.event_id
@@ -2131,6 +2134,44 @@ router.get("/api/me/calendar", requireAuth, async (req, res) => {
       listResult.rows.map((row) => row.event_id),
     );
 
+    // Exploración: eventos publicados en los que el alumno no tiene inscripción activa.
+    const availableResult = await query(
+      `SELECT
+         e.id AS event_id,
+         e.title,
+         e.description,
+         e.organizer,
+         e.location,
+         e.category,
+         e.starts_at,
+         e.ends_at,
+         e.status::text AS event_status,
+         e.hours_value,
+         e.capacity,
+         e.capacity_enabled,
+         e.resubmission_policy::text AS resubmission_policy,
+         ${EVENT_COVER_SQL},
+         (SELECT COUNT(*)::int FROM registrations rr
+           WHERE rr.event_id = e.id AND rr.status::text = ANY($3::text[])) AS registrations_count
+       FROM events e
+       WHERE e.org_id = $2
+         AND e.status = 'published'::event_status
+         AND e.starts_at IS NOT NULL
+         AND NOT EXISTS (
+           SELECT 1 FROM registrations r
+           WHERE r.event_id = e.id AND r.user_id = $1 AND r.status::text = ANY($3::text[])
+         )
+       ORDER BY e.starts_at ASC
+       LIMIT 500`,
+      [userId, DEFAULT_ORG_ID, CALENDAR_REGISTRATION_STATUSES],
+    );
+    const availableSessions = await loadUserSessionsByEvent(
+      { query },
+      userId,
+      availableResult.rows.map((row) => row.event_id),
+    );
+    const now = new Date();
+
     return res.status(200).json({
       ok: true,
       events: listResult.rows.map((row) => ({
@@ -2148,7 +2189,30 @@ router.get("/api/me/calendar", requireAuth, async (req, res) => {
         registration_status: row.registration_status,
         attendance: mapRegistrationAttendance(row),
         sessions: sessionsByEvent.get(String(row.event_id)) ?? [],
-      })),
+      })).concat(availableResult.rows.map((row) => ({
+        id: row.event_id,
+        title: row.title,
+        description: row.description,
+        organizer: row.organizer,
+        location: row.location,
+        category: row.category,
+        starts_at: row.starts_at,
+        ends_at: row.ends_at,
+        status: row.event_status,
+        hours_value: row.hours_value === null ? null : Number(row.hours_value),
+        cover_image_url: row.cover_image_url || null,
+        capacity: row.capacity,
+        capacity_enabled: row.capacity_enabled,
+        registrations_count: row.registrations_count,
+        resubmission_policy: row.resubmission_policy,
+        registration_status: null,
+        attendance: null,
+        sessions: (availableSessions.get(String(row.event_id)) ?? []).map((session) => ({
+          ...session,
+          checked_in_at: null,
+          state: new Date(session.ends_at) > now ? "available" : "ended",
+        })),
+      }))),
     });
   } catch (err) {
     console.error("Error en GET /api/me/calendar:", err.message);

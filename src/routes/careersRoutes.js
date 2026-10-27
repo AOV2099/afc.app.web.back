@@ -32,8 +32,9 @@ export function normalizeCareerInput(raw) {
 
   const hoursText = String(raw.afc_hours ?? "").trim();
   const hours = Number(hoursText);
-  if (!HOURS_PATTERN.test(hoursText) || !(hours > 0)) {
-    return { error: "Las horas AFC deben ser un número mayor a 0 con hasta 2 decimales." };
+  // 0 = la carrera no contabiliza horas AFC.
+  if (!HOURS_PATTERN.test(hoursText) || !(hours >= 0)) {
+    return { error: "Las horas AFC deben ser un número mayor o igual a 0 con hasta 2 decimales." };
   }
 
   return {

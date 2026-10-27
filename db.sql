@@ -112,10 +112,9 @@ CREATE UNIQUE INDEX IF NOT EXISTS uq_careers_clave_carrera
   ON careers (clave_carrera)
   WHERE clave_carrera IS NOT NULL;
 
-DO $$ BEGIN
-  ALTER TABLE careers
-    ADD CONSTRAINT chk_careers_afc_hours CHECK (afc_hours > 0);
-EXCEPTION WHEN duplicate_object THEN NULL; END $$;
+-- afc_hours = 0: la carrera no contabiliza horas AFC.
+ALTER TABLE careers DROP CONSTRAINT IF EXISTS chk_careers_afc_hours;
+ALTER TABLE careers ADD CONSTRAINT chk_careers_afc_hours CHECK (afc_hours >= 0);
 
 DO $$ BEGIN
   ALTER TABLE careers

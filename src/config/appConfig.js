@@ -51,6 +51,29 @@ export const BULK_STUDENT_IMPORT_PREVIEW_TTL_SECONDS = Number.isFinite(
   ? Math.min(600, Math.max(60, Math.trunc(bulkStudentImportPreviewTtl)))
   : 600;
 
+// Tope técnico de hours_ledger.hours_delta NUMERIC(6,2).
+export const HOURS_LEDGER_MAX_DELTA = 9999.99;
+
+// Vacío conserva el valor por defecto; "sin_limite" deja solo el tope técnico.
+function parseHoursUploadLimit(value, fallback) {
+  const text = String(value ?? "").trim().toLowerCase();
+  if (!text) return fallback;
+  if (text === "sin_limite") return null;
+  const hours = Number(text);
+  if (!Number.isFinite(hours) || hours <= 0) return fallback;
+  return Math.min(HOURS_LEDGER_MAX_DELTA, Math.round(hours * 100) / 100);
+}
+
+// Horas máximas por carga (ajuste manual o cada fila del CSV); null = sin límite.
+export const HOURS_UPLOAD_MAX_GLOBAL_ADMIN = parseHoursUploadLimit(
+  process.env.HOURS_UPLOAD_MAX_GLOBAL_ADMIN,
+  null,
+);
+export const HOURS_UPLOAD_MAX_CAREER_ADMIN = parseHoursUploadLimit(
+  process.env.HOURS_UPLOAD_MAX_CAREER_ADMIN,
+  100,
+);
+
 // Archivos subidos: el contenido vive en FILE_STORAGE_DIR (volumen Docker) y la tabla files guarda la ubicación.
 export const FILE_STORAGE_DIR = path.resolve(
   String(process.env.FILE_STORAGE_DIR || "").trim() || path.join(process.cwd(), "storage"),

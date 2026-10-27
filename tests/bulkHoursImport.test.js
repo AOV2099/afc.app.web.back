@@ -54,6 +54,14 @@ test("rejects invalid headers, unsafe values, hours, and duplicate accounts", ()
   assert.equal(codes.has("duplicate_adjustment"), true);
 });
 
+test("applies the per-upload hours limit to each CSV row", () => {
+  const csv = "numero_cuenta,horas,motivo\n123456789,250,Motivo válido largo";
+  const capped = parseAndValidateHoursCsv(csv);
+  assert.equal(capped.errors[0].code, "invalid_hours");
+  assert.match(capped.errors[0].message, /no exceder 100 /u);
+  assert.deepEqual(parseAndValidateHoursCsv(csv, { maxHours: null }).errors, []);
+});
+
 test("preview validates database targets and stores an opaque one-use token", async () => {
   const redis = new FakeRedis();
   const statements = [];

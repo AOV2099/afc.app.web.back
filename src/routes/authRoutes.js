@@ -27,6 +27,7 @@ import {
   getAssignableUserRoles,
   isGlobalCareerAdmin,
   isSuaDivisionCareer,
+  maxHoursPerUpload,
   PASSWORD_MANAGED_ROLES,
 } from "../services/adminUserCareerScope.js";
 import { createOAuthRateLimit } from "../middleware/oauthRateLimit.js";
@@ -516,6 +517,7 @@ router.get("/api/me", requireAuth, async (req, res) => {
               can_import_students: canImportStudents(req.auth, userRow.career_name),
               password_roles: [...PASSWORD_MANAGED_ROLES],
               views_sua_students: !isGlobalCareerAdmin(req.auth) && isSuaDivisionCareer(userRow.career_name),
+              max_hours_per_upload: maxHoursPerUpload(req.auth),
             }
           : null,
       view_as: req.auth.viewAs

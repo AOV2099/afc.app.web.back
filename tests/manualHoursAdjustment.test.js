@@ -25,6 +25,34 @@ function transactionWith(tx) {
   return async (work) => work(tx);
 }
 
+test("career admins are capped per upload and the global admin is not", async () => {
+  const neverRuns = async () => {
+    throw new Error("No debe abrir transacción");
+  };
+  await assert.rejects(
+    addManualAccountHours({ ...INPUT, hours: "100.01" }, { withTransactionFn: neverRuns }),
+    (error) => error.code === "invalid_hours" && /no exceder 100 /u.test(error.message),
+  );
+
+  const tx = {
+    async query(sql, params) {
+      if (sql.includes("FROM users u")) return { rows: [{ id: "21", career_id: 3, status: "active", role: "student" }] };
+      if (sql.includes("FROM event_categories")) return { rows: [{ key: INPUT.category }] };
+      if (sql.includes("afc_hours")) return { rows: [{ goal: "5000" }] };
+      if (sql.includes("FROM hours_ledger") && !sql.includes("INSERT")) return { rows: [{ total: "0", total_hours: "350" }] };
+      if (sql.includes("INSERT INTO hours_ledger")) {
+        return { rows: [{ id: "31", user_id: "21", hours_delta: String(params[1]), reason: "adjustment", category: INPUT.category, note: INPUT.motive, created_at: new Date(), request_id: REQUEST_ID }] };
+      }
+      throw new Error(`Consulta inesperada: ${sql}`);
+    },
+  };
+  const result = await addManualAccountHours(
+    { ...INPUT, hours: "350", admin: { userId: "1", role: "admin", careerId: 1 } },
+    { withTransactionFn: transactionWith(tx) },
+  );
+  assert.equal(result.hours_requested, 350);
+});
+
 test("validates account, positive hours, motive, and request ID", () => {
   assert.equal(normalizeAccountNumber("123456789"), "123456789");
   assert.equal(normalizeAccountNumber("12345678"), "12345678");
@@ -35,6 +63,9 @@ test("validates account, positive hours, motive, and request ID", () => {
   assert.equal(normalizeManualHours("0"), null);
   assert.equal(normalizeManualHours("100.01"), null);
   assert.equal(normalizeManualHours("1.001"), null);
+  assert.equal(normalizeManualHours("150", 120), null);
+  assert.equal(normalizeManualHours("9999.99", null), 9999.99);
+  assert.equal(normalizeManualHours("10000", null), null);
   assert.equal(normalizeAdjustmentCategory(" Culturales "), "culturales");
   assert.equal(normalizeAdjustmentCategory("categoría inválida"), null);
   assert.equal(normalizeAdjustmentMotive("Motivo válido"), "Motivo válido");

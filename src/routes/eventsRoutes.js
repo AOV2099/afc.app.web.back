@@ -1231,7 +1231,7 @@ router.post("/api/events/:eventId/register", requireAuth, async (req, res) => {
     const created = await withTransaction(async (tx) => {
       // FOR UPDATE serializa las inscripciones del evento para que el cupo no se rebase en paralelo.
       const eventResult = await tx.query(
-        `SELECT id, org_id, status, registration_mode, resubmission_policy, ends_at, capacity, capacity_enabled,
+        `SELECT id, org_id, status, registration_mode, resubmission_policy, starts_at, ends_at, capacity, capacity_enabled,
                 min_attendance_percent
          FROM events
          WHERE id = $1 AND org_id = $2
@@ -1248,9 +1248,9 @@ router.post("/api/events/:eventId/register", requireAuth, async (req, res) => {
         throw createHttpError(400, "El evento no está publicado.");
       }
 
-      const endsAt = new Date(event.ends_at);
-      if (Number.isNaN(endsAt.getTime()) || new Date() >= endsAt) {
-        throw createHttpError(400, "El evento ya no acepta registros.");
+      const closedReason = registrationClosedReason(event);
+      if (closedReason) {
+        throw createHttpError(400, closedReason);
       }
       const reachability = await loadAttendanceReachability(tx, {
         eventId,
@@ -2059,6 +2059,16 @@ router.get("/api/me/registrations", requireAuth, async (req, res) => {
   }
 });
 
+// Inscripción libre (auto): abierta hasta que termina el evento; con revisión manual cierra al iniciar.
+export function registrationClosedReason({ registration_mode, starts_at, ends_at }, now = new Date()) {
+  const endsAt = new Date(ends_at);
+  if (Number.isNaN(endsAt.getTime()) || now >= endsAt) return "El evento ya no acepta registros.";
+  if (String(registration_mode) !== "auto" && now >= new Date(starts_at)) {
+    return "Las inscripciones cerraron al iniciar el evento porque requieren aprobación del organizador.";
+  }
+  return null;
+}
+
 // Estado de cada sesión para el alumno: asistida, en curso, próxima o sin asistencia.
 export function sessionAttendanceState({ starts_at, ends_at, checked_in_at }, now = new Date()) {
   if (checked_in_at) return "attended";
@@ -2149,6 +2159,7 @@ router.get("/api/me/calendar", requireAuth, async (req, res) => {
          e.hours_value,
          e.capacity,
          e.capacity_enabled,
+         e.registration_mode::text AS registration_mode,
          e.resubmission_policy::text AS resubmission_policy,
          ${EVENT_COVER_SQL},
          (SELECT COUNT(*)::int FROM registrations rr
@@ -2204,6 +2215,7 @@ router.get("/api/me/calendar", requireAuth, async (req, res) => {
         capacity: row.capacity,
         capacity_enabled: row.capacity_enabled,
         registrations_count: row.registrations_count,
+        registration_mode: row.registration_mode,
         resubmission_policy: row.resubmission_policy,
         registration_status: null,
         attendance: null,

@@ -10,7 +10,7 @@ import {
 } from "../config/appConfig.js";
 import { query, withTransaction } from "../postgresClient.js";
 import { getRedisClient } from "../redisClient.js";
-import { assertTargetCareerAccess, maxHoursPerUpload, normalizeCareerId } from "./adminUserCareerScope.js";
+import { maxHoursPerUpload, normalizeCareerId } from "./adminUserCareerScope.js";
 import {
   effectiveHoursLimit,
   normalizeAccountNumber,
@@ -231,7 +231,7 @@ async function loadCategory(executor, category) {
   return result.rows?.[0] ?? null;
 }
 
-function validateRowsAgainstDatabase(rows, targets, importer) {
+function validateRowsAgainstDatabase(rows, targets) {
   const byAccount = new Map(targets.map((target) => [String(target.student_id), target]));
   const errors = [];
   const validatedRows = [];
@@ -250,19 +250,6 @@ function validateRowsAgainstDatabase(rows, targets, importer) {
     }
     if (target.role === ROLES.STAFF) {
       errors.push(csvError(row.row, "numero_cuenta", "staff_hours_not_allowed", "Las cuentas staff no acumulan horas AFC."));
-      continue;
-    }
-    try {
-      assertTargetCareerAccess(importer, target.career_id);
-    } catch {
-      errors.push(
-        csvError(
-          row.row,
-          "numero_cuenta",
-          "career_scope_mismatch",
-          "El usuario no pertenece a la carrera administrada.",
-        ),
-      );
       continue;
     }
     validatedRows.push({ ...row, userId: String(target.id), careerId: Number(target.career_id) });
@@ -305,7 +292,7 @@ export async function previewBulkHoursImport({ csvText, category, importer, depe
   if (!categoryRow) {
     throw new BulkHoursImportError(400, "invalid_category", "La categoría seleccionada no existe.");
   }
-  const validated = validateRowsAgainstDatabase(parsed.rows, targets, importer);
+  const validated = validateRowsAgainstDatabase(parsed.rows, targets);
   if (validated.errors.length > 0) {
     throw new BulkHoursImportError(
       422,
@@ -419,10 +406,7 @@ export async function commitBulkHoursImport({ importId, importer, dependencies =
     if (!categoryRow) {
       throw new BulkHoursImportError(409, "import_conflict", "La categoría ya no está disponible.");
     }
-    const revalidated = validateRowsAgainstDatabase(token.rows, targets, {
-      role: currentImporter.role,
-      careerId: currentImporter.career_id,
-    });
+    const revalidated = validateRowsAgainstDatabase(token.rows, targets);
     if (revalidated.errors.length > 0) {
       throw new BulkHoursImportError(
         409,

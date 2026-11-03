@@ -108,7 +108,7 @@ test("preview requires one selected catalog category", async () => {
   );
 });
 
-test("preview rejects missing, inactive, cross-career, and unknown-category rows", async () => {
+test("preview rejects missing accounts and accepts students from other careers", async () => {
   const redis = new FakeRedis();
   await assert.rejects(
     previewBulkHoursImport({
@@ -129,7 +129,8 @@ test("preview rejects missing, inactive, cross-career, and unknown-category rows
     (error) =>
       error instanceof BulkHoursImportError &&
       error.code === "database_validation_failed" &&
-      error.errors.length === 2,
+      error.errors.length === 1 &&
+      error.errors[0].code === "account_not_found",
   );
   assert.equal(redis.values.size, 0);
 });

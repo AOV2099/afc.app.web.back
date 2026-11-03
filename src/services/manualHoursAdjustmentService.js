@@ -1,6 +1,6 @@
 import { DEFAULT_ORG_ID, HOURS_LEDGER_MAX_DELTA, HOURS_UPLOAD_MAX_CAREER_ADMIN, ROLES } from "../config/appConfig.js";
 import { withTransaction } from "../postgresClient.js";
-import { assertTargetCareerAccess, maxHoursPerUpload } from "./adminUserCareerScope.js";
+import { maxHoursPerUpload } from "./adminUserCareerScope.js";
 import { capHoursToGoal, GOAL_CAP_NOTE_SEPARATOR, loadUserHoursProgress } from "./afcHoursGoal.js";
 
 const ACCOUNT_NUMBER_PATTERN = /^\d{8,10}$/u;
@@ -126,8 +126,6 @@ export async function addManualAccountHours(
         "No se encontró un usuario con ese número de cuenta.",
       );
     }
-
-    assertTargetCareerAccess(admin, target.career_id);
 
     if (target.status !== "active") {
       throw new ManualHoursAdjustmentError(

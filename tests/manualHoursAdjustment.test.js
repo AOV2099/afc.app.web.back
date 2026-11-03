@@ -208,10 +208,9 @@ test("rejects a category missing from the database catalog", async () => {
   );
 });
 
-test("rejects inactive users and cross-career targets", async () => {
+test("rejects inactive users", async () => {
   for (const [target, code] of [
     [{ id: "21", career_id: 3, status: "inactive", role: "visitor" }, "user_inactive"],
-    [{ id: "21", career_id: 4, status: "active", role: "visitor" }, "career_scope_mismatch"],
   ]) {
     const tx = { async query() { return { rows: [target] }; } };
     await assert.rejects(

@@ -161,8 +161,8 @@ test("commit consumes the token and inserts all adjustments atomically", async (
     async query(sql, params) {
       if (sql.includes("WHERE u.id")) return { rows: [{ id: "7", career_id: 3, status: "active", role: "admin" }] };
       if (sql.includes("FROM users u") && sql.includes("student_id")) return { rows: [
-        { id: "21", student_id: "123456789", career_id: 3, status: "active" },
-        { id: "22", student_id: "12345678", career_id: 3, status: "active" },
+        { id: "21", student_id: "123456789", email: "ana@aragon.unam.mx", career_id: 3, status: "active" },
+        { id: "22", student_id: "12345678", email: "luis@aragon.unam.mx", career_id: 3, status: "active" },
       ] };
       if (sql.includes("event_categories")) return { rows: [{ key: "culturales" }] };
       if (sql.includes("unnest(")) {
@@ -180,7 +180,17 @@ test("commit consumes the token and inserts all adjustments atomically", async (
     importer: { userId: "7", role: "admin", careerId: 3 },
     dependencies: { getRedisClientFn: () => redis, withTransactionFn: async (work) => work(tx) },
   });
-  assert.deepEqual(result, { ok: true, adjusted: 2, users: 2, total_hours: 2, capped_rows: 1 });
+  assert.deepEqual(result, {
+    ok: true,
+    adjusted: 2,
+    users: 2,
+    total_hours: 2,
+    capped_rows: 1,
+    report: [
+      { numero_cuenta: "123456789", correo: "ana@aragon.unam.mx", horas_agregadas: 1 },
+      { numero_cuenta: "12345678", correo: "luis@aragon.unam.mx", horas_agregadas: 1 },
+    ],
+  });
   assert.equal(inserts.length, 2);
   assert.deepEqual(inserts.map((params) => params[1]), [1, 1], "la cuenta 21 solo puede sumar 1 h hasta su meta de 240");
   assert.doesNotMatch(inserts[0][3], /Se han agregado/u, "las horas parciales no llevan leyenda");

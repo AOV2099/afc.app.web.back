@@ -211,7 +211,7 @@ async function loadTargets(executor, rows, { lock = false } = {}) {
   const accountNumbers = [...new Set(rows.map((row) => row.accountNumber).filter(Boolean))];
   if (accountNumbers.length === 0) return [];
   const result = await executor.query(
-    `SELECT u.id, u.student_id, u.career_id, u.status, m.role::text AS role
+    `SELECT u.id, u.student_id, u.email, u.career_id, u.status, m.role::text AS role
      FROM users u
      JOIN memberships m
        ON m.user_id = u.id
@@ -252,7 +252,7 @@ function validateRowsAgainstDatabase(rows, targets) {
       errors.push(csvError(row.row, "numero_cuenta", "staff_hours_not_allowed", "Las cuentas staff no acumulan horas AFC."));
       continue;
     }
-    validatedRows.push({ ...row, userId: String(target.id), careerId: Number(target.career_id) });
+    validatedRows.push({ ...row, userId: String(target.id), careerId: Number(target.career_id), email: target.email ?? null });
   }
 
   return { rows: validatedRows, errors };
@@ -428,6 +428,8 @@ export async function commitBulkHoursImport({ importId, importer, dependencies =
     let adjusted = 0;
     let totalHours = 0;
     let cappedRows = 0;
+    const report = [];
+    const emailByRow = new Map(revalidated.rows.map((row) => [row.row, row.email]));
     // Las filas de usuario ya están bloqueadas (loadTargets lock) y cada cuenta aparece una sola vez.
     const progress = await loadUsersHoursProgress(tx, token.rows.map((row) => row.userId));
     for (const row of token.rows) {
@@ -460,6 +462,7 @@ export async function commitBulkHoursImport({ importId, importer, dependencies =
       }
       adjusted += 1;
       totalHours += credited;
+      report.push({ numero_cuenta: row.accountNumber, correo: emailByRow.get(row.row) ?? null, horas_agregadas: credited });
     }
 
     return {
@@ -468,6 +471,7 @@ export async function commitBulkHoursImport({ importId, importer, dependencies =
       users: token.summary.users,
       total_hours: Math.round(totalHours * 100) / 100,
       capped_rows: cappedRows,
+      report,
     };
   });
 }

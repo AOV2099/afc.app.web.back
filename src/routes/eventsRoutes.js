@@ -71,13 +71,10 @@ const limitEventViews = createOAuthRateLimit({
   code: "event_views_rate_limited",
   message: "Demasiadas solicitudes. Espera un momento.",
 });
-const COUNTER_TTL_SECONDS = 60 * 5;
-const RECENT_CHECKINS_DEFAULT_LIMIT = 20;
-const RECENT_CHECKINS_MAX_LIMIT = 50;
 const TIMESERIES_DEFAULT_TIMEZONE = "America/Mexico_City";
 const TIMESERIES_DEFAULT_WINDOW_HOURS = 24;
-const VIEWS_SERIES_TTL_SECONDS = 60 * 60 * 24 * 90;
 const TIMELINE_TTL_SECONDS = 60 * 60 * 24 * 90;
+const REPORT_EXCLUDED_REGISTRATION_STATUSES = ["rejected", "blocked", "cancelled_by_user", "cancelled_by_admin"];
 
 const EVENT_TYPE_CATALOG = Object.freeze({
   inscription: "Inscripción",
@@ -223,21 +220,6 @@ function getCheckinEventTypeByResult(result) {
   return EVENT_TYPE_CATALOG.checkin_failed;
 }
 
-async function incrementCachedCounter({ key, countSql, countParams = [] }) {
-  const redis = getRedisClient();
-  if (!redis) return;
-
-  try {
-    void countSql;
-    void countParams;
-    await redis.set(key, "0", { EX: COUNTER_TTL_SECONDS, NX: true });
-    await redis.incr(key);
-    await redis.expire(key, COUNTER_TTL_SECONDS);
-  } catch (err) {
-    console.warn(`Redis counter update failed for ${key}:`, err.message);
-  }
-}
-
 export async function getEventRegistrationsCount(eventId) {
   const normalizedEventId = Number(eventId);
   if (!Number.isInteger(normalizedEventId) || normalizedEventId <= 0) {
@@ -255,328 +237,28 @@ export async function getEventRegistrationsCount(eventId) {
   return Number(countResult.rows?.[0]?.total ?? 0);
 }
 
-async function getCachedCounterValue({ key, countSql, countParams = [] }) {
-  const redis = getRedisClient();
-
-  if (redis) {
-    try {
-      const cached = await redis.get(key);
-      if (cached !== null) {
-        const parsed = Number(cached);
-        if (Number.isInteger(parsed) && parsed >= 0) {
-          return parsed;
-        }
-      }
-    } catch (err) {
-      console.warn(`Redis read failed for ${key}:`, err.message);
-    }
-  }
-
-  const countResult = await query(countSql, countParams);
-  const total = Number(countResult.rows?.[0]?.total ?? 0);
-
-  if (redis) {
-    try {
-      await redis.set(key, String(total), { EX: COUNTER_TTL_SECONDS });
-    } catch (err) {
-      console.warn(`Redis write failed for ${key}:`, err.message);
-    }
-  }
-
-  return total;
-}
-
+// Inscritos vigentes (mismo criterio que el reporte), solicitudes por revisar y check-ins rechazados por geocerca.
 async function getEventRegistrationStats(eventId) {
   const normalizedEventId = Number(eventId);
   if (!Number.isInteger(normalizedEventId) || normalizedEventId <= 0) {
     throw createHttpError(400, "eventId inválido.");
   }
 
-  const totalResult = await query(
-    `SELECT COUNT(*)::int AS total
-     FROM registrations
-     WHERE event_id = $1`,
-    [normalizedEventId],
+  const result = await query(
+    `SELECT
+       (SELECT COUNT(*)::int FROM registrations r
+         WHERE r.event_id = $1 AND r.status::text <> ALL($2::text[])) AS registrations,
+       (SELECT COUNT(*)::int FROM registrations r
+         WHERE r.event_id = $1 AND r.status::text IN ('pending', 'changes_requested')) AS pending,
+       (SELECT COUNT(*)::int FROM checkins c
+         WHERE c.event_id = $1 AND c.result = 'rejected'::checkin_result) AS rejected_checkins`,
+    [normalizedEventId, REPORT_EXCLUDED_REGISTRATION_STATUSES],
   );
-  const approvedResult = await query(
-    `SELECT COUNT(*)::int AS total
-     FROM registrations
-     WHERE event_id = $1
-       AND status = 'approved'::registration_status`,
-    [normalizedEventId],
-  );
-  const pendingResult = await query(
-    `SELECT COUNT(*)::int AS total
-     FROM registrations
-     WHERE event_id = $1
-       AND status = 'pending'::registration_status`,
-    [normalizedEventId],
-  );
-
-  const total = Number(totalResult.rows?.[0]?.total ?? 0);
-  const approved = Number(approvedResult.rows?.[0]?.total ?? 0);
-  const pending = Number(pendingResult.rows?.[0]?.total ?? 0);
-
-  return { total, approved, pending };
-}
-
-async function getSessionLiveStats(eventId, sessionId) {
-  const normalizedEventId = Number(eventId);
-  const normalizedSessionId = Number(sessionId);
-
-  if (!Number.isInteger(normalizedEventId) || normalizedEventId <= 0) {
-    throw createHttpError(400, "eventId inválido.");
-  }
-  if (!Number.isInteger(normalizedSessionId) || normalizedSessionId <= 0) {
-    throw createHttpError(400, "sessionId inválido.");
-  }
-
-  const statsKey = `event:${normalizedEventId}:session:${normalizedSessionId}:stats`;
-  const presentUsersKey = `event:${normalizedEventId}:session:${normalizedSessionId}:present_users_count`;
-  const redis = getRedisClient();
-
-  if (redis) {
-    try {
-      const [rawStats, rawPresentUsers] = await Promise.all([
-        redis.hGetAll(statsKey),
-        redis.get(presentUsersKey),
-      ]);
-
-      if (rawStats && Object.keys(rawStats).length > 0) {
-        const parsed = {
-          accepted: Number(rawStats.accepted ?? 0),
-          rejected: Number(rawStats.rejected ?? 0),
-          duplicate: Number(rawStats.duplicate ?? 0),
-          invalid_ticket: Number(rawStats.invalid_ticket ?? 0),
-          cancelled_ticket: Number(rawStats.cancelled_ticket ?? 0),
-          total: Number(rawStats.total ?? 0),
-          present_users: Number(rawPresentUsers ?? 0),
-        };
-
-        if (
-          Object.values(parsed).every((v) => Number.isInteger(v) && v >= 0)
-        ) {
-          return parsed;
-        }
-      }
-    } catch (err) {
-      console.warn(`Redis read failed for ${statsKey}:`, err.message);
-    }
-  }
-
+  const row = result.rows?.[0] || {};
   return {
-    accepted: 0,
-    rejected: 0,
-    duplicate: 0,
-    invalid_ticket: 0,
-    cancelled_ticket: 0,
-    total: 0,
-    present_users: 0,
-  };
-}
-
-async function getRecentSessionCheckins(eventId, sessionId, limit) {
-  const normalizedEventId = Number(eventId);
-  const normalizedSessionId = Number(sessionId);
-  const normalizedLimit = Math.min(
-    RECENT_CHECKINS_MAX_LIMIT,
-    Math.max(1, Number(limit || RECENT_CHECKINS_DEFAULT_LIMIT)),
-  );
-
-  if (!Number.isInteger(normalizedEventId) || normalizedEventId <= 0) {
-    throw createHttpError(400, "eventId inválido.");
-  }
-  if (!Number.isInteger(normalizedSessionId) || normalizedSessionId <= 0) {
-    throw createHttpError(400, "sessionId inválido.");
-  }
-
-  const cacheKey = `event:${normalizedEventId}:session:${normalizedSessionId}:recent_checkins:${RECENT_CHECKINS_MAX_LIMIT}`;
-  const redis = getRedisClient();
-
-  if (redis) {
-    try {
-      const raw = await redis.lRange(cacheKey, 0, normalizedLimit - 1);
-      return raw
-        .map((item) => {
-          try {
-            return JSON.parse(item);
-          } catch {
-            return null;
-          }
-        })
-        .filter(Boolean);
-    } catch (err) {
-      console.warn(`Redis read failed for ${cacheKey}:`, err.message);
-    }
-  }
-
-  return [];
-}
-
-function formatBucketKey(timestampMs, tz, bucket) {
-  const parts = new Intl.DateTimeFormat("en-CA", {
-    timeZone: tz,
-    year: "numeric",
-    month: "2-digit",
-    day: "2-digit",
-    hour: bucket === "hour" ? "2-digit" : undefined,
-    hour12: false,
-  }).formatToParts(new Date(timestampMs));
-
-  const map = Object.fromEntries(parts.map((p) => [p.type, p.value]));
-  if (bucket === "hour") {
-    return `${map.year}-${map.month}-${map.day}T${map.hour}:00:00`;
-  }
-  return `${map.year}-${map.month}-${map.day}`;
-}
-
-function buildBucketTimeline({ from, to, tz, bucket }) {
-  const start = new Date(from).getTime();
-  const end = new Date(to).getTime();
-  const stepMs = bucket === "day" ? 24 * 60 * 60 * 1000 : 60 * 60 * 1000;
-  const keys = [];
-
-  for (let t = start; t <= end; t += stepMs) {
-    const key = formatBucketKey(t, tz, bucket);
-    if (keys[keys.length - 1] !== key) keys.push(key);
-  }
-
-  return keys;
-}
-
-async function getHourlySeriesFromRedis(redisKey, { from, to, tz, bucket }) {
-  const redis = getRedisClient();
-  const timeline = buildBucketTimeline({ from, to, tz, bucket });
-  const values = new Map(timeline.map((key) => [key, 0]));
-
-  if (!redis) {
-    return timeline.map((key) => ({ bucket_start: key, count: 0 }));
-  }
-
-  try {
-    const items = await redis.zRangeWithScores(redisKey, 0, -1);
-    const fromSec = Math.floor(new Date(from).getTime() / 1000);
-    const toSec = Math.floor(new Date(to).getTime() / 1000);
-
-    for (const item of items) {
-      const epochSec = Number(item.value);
-      if (!Number.isInteger(epochSec)) continue;
-      if (epochSec < fromSec || epochSec > toSec) continue;
-
-      const key = formatBucketKey(epochSec * 1000, tz, bucket);
-      if (values.has(key)) {
-        values.set(key, Number(values.get(key) || 0) + Number(item.score || 0));
-      }
-    }
-  } catch (err) {
-    console.warn(`Redis read failed for ${redisKey}:`, err.message);
-  }
-
-  return timeline.map((key) => ({ bucket_start: key, count: Number(values.get(key) || 0) }));
-}
-
-async function getTimelineEvents(redisKey) {
-  const redis = getRedisClient();
-  if (!redis) return [];
-
-  try {
-    const rows = await redis.zRange(redisKey, 0, -1);
-    return rows
-      .map((row) => {
-        try {
-          return JSON.parse(row);
-        } catch {
-          return null;
-        }
-      })
-      .filter(Boolean);
-  } catch (err) {
-    console.warn(`Redis read failed for ${redisKey}:`, err.message);
-    return [];
-  }
-}
-
-async function getEventActivitySeries({ eventId }) {
-  const normalizedEventId = Number(eventId);
-  if (!Number.isInteger(normalizedEventId) || normalizedEventId <= 0) {
-    throw createHttpError(400, "eventId inválido.");
-  }
-
-  const [inscriptionsTimeline, viewsTimeline, checkinsTimeline] = await Promise.all([
-    getTimelineEvents(`event:${normalizedEventId}:inscriptions:timeline`),
-    getTimelineEvents(`event:${normalizedEventId}:views:timeline`),
-    getTimelineEvents(`event:${normalizedEventId}:checkins:timeline`),
-  ]);
-
-  const registrationsCreated = inscriptionsTimeline.filter(
-    (event) =>
-      event?.event_type === "inscripcion" ||
-      event?.event_type === "Inscripción" ||
-      event?.event_type === EVENT_TYPE_CATALOG.inscription ||
-      event?.type === "registration",
-  ).length;
-  const registrationRequests = inscriptionsTimeline.filter(
-    (event) => event?.event_type === EVENT_TYPE_CATALOG.inscription_request,
-  ).length;
-  const registrationsCancelled = inscriptionsTimeline.filter(
-    (event) =>
-      event?.event_type === "baja" ||
-      event?.event_type === "Baja" ||
-      event?.event_type === EVENT_TYPE_CATALOG.unregistration ||
-      event?.type === "unregistration",
-  ).length;
-
-  const checkinsAccepted = checkinsTimeline.filter(
-    (event) =>
-      event?.event_type === "checkin_exitoso" ||
-      event?.event_type === EVENT_TYPE_CATALOG.checkin_accepted ||
-      (event?.type === "checkin" && event?.result === "accepted"),
-  ).length;
-  const checkinsRejected = checkinsTimeline.filter(
-    (event) =>
-      event?.event_type === "checkin_rechazado" ||
-      event?.event_type === EVENT_TYPE_CATALOG.checkin_rejected ||
-      (event?.type === "checkin" && event?.result === "rejected"),
-  ).length;
-  const checkinsDuplicate = checkinsTimeline.filter(
-    (event) =>
-      event?.event_type === EVENT_TYPE_CATALOG.checkin_duplicate ||
-      (event?.type === "checkin" && event?.result === "duplicate"),
-  ).length;
-  const checkinsInvalidTicket = checkinsTimeline.filter(
-    (event) =>
-      event?.event_type === EVENT_TYPE_CATALOG.checkin_invalid_ticket ||
-      (event?.type === "checkin" && event?.result === "invalid_ticket"),
-  ).length;
-  const checkinsCancelledTicket = checkinsTimeline.filter(
-    (event) =>
-      event?.event_type === EVENT_TYPE_CATALOG.checkin_cancelled_ticket ||
-      (event?.type === "checkin" && event?.result === "cancelled_ticket"),
-  ).length;
-  const checkinsFailed = checkinsTimeline.filter(
-    (event) =>
-      event?.event_type === "checkin_fallido" ||
-      event?.event_type === EVENT_TYPE_CATALOG.checkin_failed ||
-      (event?.type === "checkin" && event?.result !== "accepted" && event?.result !== "rejected"),
-  ).length;
-
-  return {
-    inscriptions_count: Math.max(0, Number(registrationsCreated || 0) - Number(registrationsCancelled || 0)),
-    views_count: viewsTimeline.length,
-    checkins_count: checkinsTimeline.length,
-    checkins_breakdown: {
-      exitosos: checkinsAccepted,
-      rechazados: checkinsRejected,
-      fallidos: checkinsFailed,
-      duplicados: checkinsDuplicate,
-      ticket_invalido: checkinsInvalidTicket,
-      ticket_cancelado: checkinsCancelledTicket,
-    },
-    registrations_breakdown: {
-      inscripciones: registrationsCreated,
-      solicitudes_inscripcion: registrationRequests,
-      bajas: registrationsCancelled,
-    },
+    registrations: Number(row.registrations ?? 0),
+    pending: Number(row.pending ?? 0),
+    rejectedCheckins: Number(row.rejected_checkins ?? 0),
   };
 }
 
@@ -716,21 +398,6 @@ async function getRecentActivityStack({ eventId, limit = 30 }) {
   }
 }
 
-async function invalidateRecentCheckinsCache(eventId, sessionId) {
-  const redis = getRedisClient();
-  if (!redis?.scanIterator) return;
-
-  const pattern = `event:${eventId}:session:${sessionId}:recent_checkins:*`;
-
-  try {
-    for await (const key of redis.scanIterator({ MATCH: pattern, COUNT: 100 })) {
-      await redis.del(key);
-    }
-  } catch (err) {
-    console.warn(`Redis cache invalidation failed for ${pattern}:`, err.message);
-  }
-}
-
 async function deleteEventRedisKeys(eventId) {
   const redis = getRedisClient();
   if (!redis?.scanIterator) return;
@@ -746,39 +413,6 @@ async function deleteEventRedisKeys(eventId) {
   }
 }
 
-async function incrementSessionLiveCounter(eventId, sessionId, result) {
-  const redis = getRedisClient();
-  if (!redis) return;
-
-  const statsKey = `event:${eventId}:session:${sessionId}:stats`;
-  const presentUsersKey = `event:${eventId}:session:${sessionId}:present_users_count`;
-
-  try {
-    await redis.hIncrBy(statsKey, result, 1);
-    await redis.hIncrBy(statsKey, "total", 1);
-    await redis.expire(statsKey, COUNTER_TTL_SECONDS);
-
-    if (result === "accepted") {
-      await redis.incr(presentUsersKey);
-      await redis.expire(presentUsersKey, COUNTER_TTL_SECONDS);
-    }
-
-  } catch (err) {
-    console.warn(`Redis live counter update failed for ${statsKey}:`, err.message);
-  }
-}
-
-async function incrementHourlyCounter(redisKey, incrementBy = 1) {
-  const redis = getRedisClient();
-  if (!redis) return;
-
-  const now = Date.now();
-  const hourBucketEpochSec = Math.floor(now / (60 * 60 * 1000)) * 60 * 60;
-
-  await redis.zIncrBy(redisKey, incrementBy, String(hourBucketEpochSec));
-  await redis.expire(redisKey, VIEWS_SERIES_TTL_SECONDS);
-}
-
 async function appendTimelineEvent(redisKey, payload = {}) {
   const redis = getRedisClient();
   if (!redis) return;
@@ -788,34 +422,6 @@ async function appendTimelineEvent(redisKey, payload = {}) {
 
   await redis.zAdd(redisKey, [{ score: ts, value: JSON.stringify({ ts, ...payload, member }) }]);
   await redis.expire(redisKey, TIMELINE_TTL_SECONDS);
-}
-
-async function appendRecentCheckin({ eventId, sessionId, payload }) {
-  const redis = getRedisClient();
-  if (!redis) return;
-
-  const key = `event:${eventId}:session:${sessionId}:recent_checkins:${RECENT_CHECKINS_MAX_LIMIT}`;
-
-  await redis.lPush(key, JSON.stringify(payload));
-  await redis.lTrim(key, 0, RECENT_CHECKINS_MAX_LIMIT - 1);
-  await redis.expire(key, COUNTER_TTL_SECONDS);
-}
-
-async function decrementCachedCounter(key) {
-  const redis = getRedisClient();
-  if (!redis) return;
-
-  try {
-    await redis.set(key, "0", { EX: COUNTER_TTL_SECONDS, NX: true });
-    const nextValue = await redis.decr(key);
-    if (Number(nextValue) < 0) {
-      await redis.set(key, "0", { EX: COUNTER_TTL_SECONDS });
-    } else {
-      await redis.expire(key, COUNTER_TTL_SECONDS);
-    }
-  } catch (err) {
-    console.warn(`Redis counter decrement failed for ${key}:`, err.message);
-  }
 }
 
 async function trackEventView(eventId) {
@@ -829,27 +435,33 @@ async function trackEventView(eventId) {
   return { tracked: true };
 }
 
-async function getTimelineFromRedis({ eventId, type, from, to, limit }) {
+// Inscripciones y check-ins aceptados salen de Postgres (no expiran); las vistas solo existen en Redis.
+async function getEventTimeline({ eventId, type, from, to, limit }) {
+  if (type === "inscriptions" || type === "checkins") {
+    const sql =
+      type === "inscriptions"
+        ? `SELECT submitted_at AS at FROM registrations
+           WHERE event_id = $1 AND submitted_at BETWEEN $2 AND $3
+           ORDER BY submitted_at ASC LIMIT $4`
+        : `SELECT scanned_at AS at FROM checkins
+           WHERE event_id = $1 AND result = 'accepted'::checkin_result AND scanned_at BETWEEN $2 AND $3
+           ORDER BY scanned_at ASC LIMIT $4`;
+    const result = await query(sql, [eventId, from, to, limit]);
+    return result.rows.map((row) => ({ ts: new Date(row.at).getTime(), type }));
+  }
+  if (type !== "views") {
+    throw createHttpError(400, "type inválido. Usa: views, inscriptions, checkins.");
+  }
+
   const redis = getRedisClient();
   if (!redis) {
     throw createHttpError(503, "Redis no está listo.");
   }
 
-  const timelineKeys = {
-    views: `event:${eventId}:views:timeline`,
-    inscriptions: `event:${eventId}:inscriptions:timeline`,
-    checkins: `event:${eventId}:checkins:timeline`,
-  };
-
-  const redisKey = timelineKeys[type];
-  if (!redisKey) {
-    throw createHttpError(400, "type inválido. Usa: views, inscriptions, checkins.");
-  }
-
   const fromMs = new Date(from).getTime();
   const toMs = new Date(to).getTime();
 
-  const rows = await redis.zRangeByScore(redisKey, fromMs, toMs, {
+  const rows = await redis.zRangeByScore(`event:${eventId}:views:timeline`, fromMs, toMs, {
     LIMIT: { offset: 0, count: limit },
   });
 
@@ -1297,7 +909,6 @@ router.post("/api/events/:eventId/register", requireAuth, async (req, res) => {
 
       let registration = null;
       let previousStatus = null;
-      let registrationCountDelta = 0;
 
       if (!existingRegistration) {
         await ensureCapacityAvailable();
@@ -1310,7 +921,6 @@ router.post("/api/events/:eventId/register", requireAuth, async (req, res) => {
         );
 
         registration = registrationResult.rows[0];
-        registrationCountDelta = 1;
       } else {
         previousStatus = String(existingRegistration.status || "");
         const blockedUntil = existingRegistration.blocked_until
@@ -1354,7 +964,6 @@ router.post("/api/events/:eventId/register", requireAuth, async (req, res) => {
         );
 
         registration = reactivatedResult.rows[0];
-        registrationCountDelta = 1;
       }
 
       let ticket = null;
@@ -1422,11 +1031,6 @@ router.post("/api/events/:eventId/register", requireAuth, async (req, res) => {
         );
       }
 
-      const approvedDelta =
-        (registrationStatus === "approved" ? 1 : 0) - (previousStatus === "approved" ? 1 : 0);
-      const pendingDelta =
-        (registrationStatus === "pending" ? 1 : 0) - (previousStatus === "pending" ? 1 : 0);
-
       return {
         eventId,
         registration,
@@ -1434,19 +1038,8 @@ router.post("/api/events/:eventId/register", requireAuth, async (req, res) => {
         approved: registrationStatus === "approved",
         isReactivation: Boolean(existingRegistration),
         previousStatus,
-        registrationCountDelta,
-        approvedDelta,
-        pendingDelta,
       };
     });
-
-    if (created.registrationCountDelta > 0) {
-      await incrementCachedCounter({
-        key: `event:${created.eventId}:registrations_count`,
-        countSql: `SELECT COUNT(*)::int AS total FROM registrations WHERE event_id = $1`,
-        countParams: [created.eventId],
-      });
-    }
 
     await appendTimelineEvent(`event:${created.eventId}:inscriptions:timeline`, {
       type: "registration",
@@ -1459,30 +1052,6 @@ router.post("/api/events/:eventId/register", requireAuth, async (req, res) => {
       registration_id: created.registration?.id || null,
       reactivated: Boolean(created.isReactivation),
     });
-
-    if (created.approvedDelta > 0) {
-      await incrementCachedCounter({
-        key: `event:${created.eventId}:approved_count`,
-        countSql: `SELECT COUNT(*)::int AS total
-                   FROM registrations
-                   WHERE event_id = $1 AND status = 'approved'::registration_status`,
-        countParams: [created.eventId],
-      });
-    } else if (created.approvedDelta < 0) {
-      await decrementCachedCounter(`event:${created.eventId}:approved_count`);
-    }
-
-    if (created.pendingDelta > 0) {
-      await incrementCachedCounter({
-        key: `event:${created.eventId}:pending_count`,
-        countSql: `SELECT COUNT(*)::int AS total
-                   FROM registrations
-                   WHERE event_id = $1 AND status = 'pending'::registration_status`,
-        countParams: [created.eventId],
-      });
-    } else if (created.pendingDelta < 0) {
-      await decrementCachedCounter(`event:${created.eventId}:pending_count`);
-    }
 
     return res.status(created.isReactivation ? 200 : 201).json({
       ok: true,
@@ -1671,15 +1240,6 @@ router.post("/api/events/:eventId/unregister", requireAuth, async (req, res) => 
     });
 
     if (result.mode === "cancelled") {
-      await decrementCachedCounter(`event:${eventId}:registrations_count`);
-
-      if (result.previousStatus === "approved") {
-        await decrementCachedCounter(`event:${eventId}:approved_count`);
-      }
-      if (result.previousStatus === "pending") {
-        await decrementCachedCounter(`event:${eventId}:pending_count`);
-      }
-
       await appendTimelineEvent(`event:${eventId}:inscriptions:timeline`, {
         type: "unregistration",
         event_type: EVENT_TYPE_CATALOG.unregistration,
@@ -1703,13 +1263,6 @@ router.post("/api/events/:eventId/unregister", requireAuth, async (req, res) => 
       user_id: userId,
       registration_id: result.registration?.id || null,
     });
-
-    if (result.previousStatus === "approved") {
-      await decrementCachedCounter(`event:${eventId}:approved_count`);
-    }
-    if (result.previousStatus === "pending") {
-      await decrementCachedCounter(`event:${eventId}:pending_count`);
-    }
 
     return res.status(202).json({
       ok: true,
@@ -2876,15 +2429,6 @@ router.post(
       });
 
       if (reviewed.mode === "registration_approved") {
-        await incrementCachedCounter({
-          key: `event:${reviewed.eventId}:approved_count`,
-          countSql: `SELECT COUNT(*)::int AS total
-                     FROM registrations
-                     WHERE event_id = $1 AND status = 'approved'::registration_status`,
-          countParams: [reviewed.eventId],
-        });
-        await decrementCachedCounter(`event:${reviewed.eventId}:pending_count`);
-
         await appendTimelineEvent(`event:${reviewed.eventId}:inscriptions:timeline`, {
           type: "registration",
           event_type: EVENT_TYPE_CATALOG.inscription,
@@ -2894,8 +2438,6 @@ router.post(
           reviewed_by: reviewerId,
         });
       } else if (reviewed.mode === "registration_denied") {
-        await decrementCachedCounter(`event:${reviewed.eventId}:pending_count`);
-
         await appendTimelineEvent(`event:${reviewed.eventId}:inscriptions:timeline`, {
           type: "registration",
           event_type: EVENT_TYPE_CATALOG.inscription_request,
@@ -2906,8 +2448,6 @@ router.post(
           review_action: "deny",
         });
       } else if (reviewed.mode === "cancellation_approved") {
-        await decrementCachedCounter(`event:${reviewed.eventId}:registrations_count`);
-
         await appendTimelineEvent(`event:${reviewed.eventId}:inscriptions:timeline`, {
           type: "unregistration",
           event_type: EVENT_TYPE_CATALOG.unregistration,
@@ -2917,24 +2457,6 @@ router.post(
           reviewed_by: reviewerId,
         });
       } else if (reviewed.mode === "cancellation_denied") {
-        if (reviewed.restoredStatus === "approved") {
-          await incrementCachedCounter({
-            key: `event:${reviewed.eventId}:approved_count`,
-            countSql: `SELECT COUNT(*)::int AS total
-                       FROM registrations
-                       WHERE event_id = $1 AND status = 'approved'::registration_status`,
-            countParams: [reviewed.eventId],
-          });
-        } else if (reviewed.restoredStatus === "pending") {
-          await incrementCachedCounter({
-            key: `event:${reviewed.eventId}:pending_count`,
-            countSql: `SELECT COUNT(*)::int AS total
-                       FROM registrations
-                       WHERE event_id = $1 AND status = 'pending'::registration_status`,
-            countParams: [reviewed.eventId],
-          });
-        }
-
         await appendTimelineEvent(`event:${reviewed.eventId}:inscriptions:timeline`, {
           type: "unregistration_request",
           event_type: EVENT_TYPE_CATALOG.unregistration_request,
@@ -3020,7 +2542,7 @@ router.get(
       }
       assertEventCareerAccess(req.auth.careerId, eventResult.rows[0].owner_career_id);
 
-      const timeline = await getTimelineFromRedis({
+      const timeline = await getEventTimeline({
         eventId,
         type,
         from: from.toISOString(),
@@ -3064,17 +2586,9 @@ router.get(
   requireEventManager,
   async (req, res) => {
     const eventId = Number(req.params.eventId);
-    const sessionId = req.query?.sessionId ? Number(req.query.sessionId) : null;
-    const recentLimit = req.query?.recentLimit
-      ? Number(req.query.recentLimit)
-      : RECENT_CHECKINS_DEFAULT_LIMIT;
 
     if (!Number.isInteger(eventId) || eventId <= 0) {
       return res.status(400).json({ ok: false, message: "eventId inválido." });
-    }
-
-    if (req.query?.sessionId && (!Number.isInteger(sessionId) || sessionId <= 0)) {
-      return res.status(400).json({ ok: false, message: "sessionId inválido." });
     }
 
     try {
@@ -3095,60 +2609,29 @@ router.get(
       }
       assertEventCareerAccess(req.auth.careerId, event.owner_career_id);
 
-      const registrationStats = await getEventRegistrationStats(eventId);
-      const activitySeries = await getEventActivitySeries({
-        eventId,
-      });
-      const recentActivityStack = await getRecentActivityStack({
-        eventId,
-        limit: 30,
-      });
-
-      const sessionsResult = await query(
-        `SELECT id, starts_at, ends_at, label, hours_value
-         FROM event_sessions
-         WHERE event_id = $1
-         ORDER BY starts_at ASC`,
-        [eventId],
-      );
-
-      const sessions = sessionsResult.rows;
-
-      let selectedSession = null;
-      if (sessionId !== null) {
-        selectedSession = sessions.find((s) => Number(s.id) === sessionId) || null;
-        if (!selectedSession) {
-          return res.status(404).json({ ok: false, message: "Sesión no encontrada." });
-        }
-      } else if (sessions.length > 0) {
-        selectedSession = sessions[0];
-      }
-
-      let live = null;
-      if (selectedSession) {
-        const stats = await getSessionLiveStats(eventId, selectedSession.id);
-        const recent = await getRecentSessionCheckins(eventId, selectedSession.id, recentLimit);
-
-        live = {
-          session: selectedSession,
-          stats,
-          recent_checkins: recent,
-        };
-      }
+      const [registrationStats, recentActivityStack, sessionsResult] = await Promise.all([
+        getEventRegistrationStats(eventId),
+        getRecentActivityStack({ eventId, limit: 30 }),
+        query(
+          `SELECT id, starts_at, ends_at, label, hours_value
+           FROM event_sessions
+           WHERE event_id = $1
+           ORDER BY starts_at ASC`,
+          [eventId],
+        ),
+      ]);
 
       return res.status(200).json({
         ok: true,
         event: mapEventForResponse(event),
         event_type_catalog: EVENT_TYPE_CATALOG,
         registration_stats: {
-          registrations_count: registrationStats.total,
-          approved_count: registrationStats.approved,
+          registrations_count: registrationStats.registrations,
           pending_count: registrationStats.pending,
+          rejected_checkins_count: registrationStats.rejectedCheckins,
         },
-        activity_series: activitySeries,
         recent_activity_stack: recentActivityStack,
-        sessions,
-        live,
+        sessions: sessionsResult.rows,
       });
     } catch (err) {
       if (err?.statusCode === 403) {
@@ -3163,6 +2646,76 @@ router.get(
         ok: false,
         message: "No se pudo obtener el dashboard del evento.",
       });
+    }
+  },
+);
+
+
+export function mapEventReportRow(row) {
+  const checkins = (row.checkins || []).map((value) => new Date(value).toISOString());
+  return {
+    numero_cuenta: row.student_id || null,
+    correo: row.email || null,
+    carrera: row.career_name || null,
+    check_in: checkins.length > 0,
+    checkins,
+  };
+}
+
+// Inscritos vigentes más quien haya hecho check-in aunque después se diera de baja.
+router.get(
+  "/api/admin/events/:eventId/report",
+  requireAuth,
+  requireEventManager,
+  async (req, res) => {
+    const eventId = Number(req.params.eventId);
+    if (!Number.isInteger(eventId) || eventId <= 0) {
+      return res.status(400).json({ ok: false, message: "eventId inválido." });
+    }
+
+    try {
+      const eventResult = await query(
+        `SELECT e.id, e.title, e.starts_at, e.ends_at, e.status::text AS status,
+                owner_user.career_id AS owner_career_id
+         FROM events e
+         LEFT JOIN users owner_user ON owner_user.id = e.created_by
+         WHERE e.id = $1 AND e.org_id = $2
+         LIMIT 1`,
+        [eventId, DEFAULT_ORG_ID],
+      );
+      const event = eventResult.rows?.[0];
+      if (!event) {
+        return res.status(404).json({ ok: false, message: "Evento no encontrado." });
+      }
+      assertEventCareerAccess(req.auth.careerId, event.owner_career_id);
+
+      const rowsResult = await query(
+        `SELECT u.student_id, u.email, c.name AS career_name, ck.checkins
+         FROM registrations r
+         JOIN users u ON u.id = r.user_id
+         LEFT JOIN careers c ON c.id = u.career_id
+         LEFT JOIN LATERAL (
+           SELECT array_agg(x.scanned_at ORDER BY x.scanned_at) AS checkins
+           FROM checkins x
+           WHERE x.event_id = r.event_id AND x.user_id = r.user_id AND x.result = 'accepted'::checkin_result
+         ) ck ON TRUE
+         WHERE r.event_id = $1
+           AND (r.status::text <> ALL($2::text[]) OR ck.checkins IS NOT NULL)
+         ORDER BY (ck.checkins IS NULL), u.last_name, u.first_name, u.id`,
+        [eventId, REPORT_EXCLUDED_REGISTRATION_STATUSES],
+      );
+
+      return res.status(200).json({
+        ok: true,
+        event: { id: event.id, title: event.title, starts_at: event.starts_at, ends_at: event.ends_at, status: event.status },
+        rows: rowsResult.rows.map(mapEventReportRow),
+      });
+    } catch (err) {
+      if (err?.statusCode === 403) {
+        return res.status(403).json({ ok: false, code: err.code, message: err.message });
+      }
+      console.error("Error en GET /api/admin/events/:eventId/report:", err.message);
+      return res.status(500).json({ ok: false, message: "No se pudo obtener el reporte del evento." });
     }
   },
 );
@@ -3634,7 +3187,6 @@ router.post(
       });
 
       if (scan.event_id && scan.session_id) {
-        await incrementSessionLiveCounter(scan.event_id, scan.session_id, scan.result);
         const checkinTimelineEventType = getCheckinEventTypeByResult(scan.result);
 
         await appendTimelineEvent(`event:${scan.event_id}:checkins:timeline`, {
@@ -3644,21 +3196,6 @@ router.post(
           result: scan.result,
           user_id: scan.user_id ?? null,
           ticket_id: scan.ticket_id ?? null,
-        });
-      }
-
-      if (scan.event_id) {
-        await appendRecentCheckin({
-          eventId: scan.event_id,
-          sessionId: scan.session_id ?? null,
-          payload: {
-            id: scan.checkin?.id ?? null,
-            scanned_at: scan.checkin?.scanned_at ?? new Date().toISOString(),
-            result: scan.result,
-            reason: scan.reason,
-            user_id: scan.user_id ?? null,
-            ticket_id: scan.ticket_id ?? null,
-          },
         });
       }
 
